@@ -32,12 +32,18 @@ HORIZON_YEARS: int      = 10        # investment horizon in years
 MONTHS_PER_YEAR: int    = 12
 HORIZON_MONTHS: int     = HORIZON_YEARS * MONTHS_PER_YEAR
 
-BLOCK_SIZE: int         = 12        # block-bootstrap block length in months
+BLOCK_SIZE: int         = 6        # block-bootstrap block length in months
                                     # 1 = classic iid bootstrap (no autocorrelation)
                                     # 12 = sample year-long consecutive blocks
 
 USE_AFTER_TER_RETURNS: bool = True  # True → month_return_after_TER
 RANDOM_SEED: int | None     = None  # set to int for reproducibility
+
+# Date-range cutoff for the historical returns used in the bootstrap.
+# Format: "YYYY-MM" strings, or None to use the full available history.
+# Useful to avoid overfitting to specific market regimes (e.g. COVID, GFC).
+DATE_START: str | None = None       # e.g. "2002-03"
+DATE_END:   str | None = None       # e.g. "2019-05"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Metric parameters

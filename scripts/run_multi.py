@@ -35,6 +35,10 @@ def main() -> None:
                         help="Horizon in years")
     parser.add_argument("--block-size", type=int, default=None,
                         help="Block-bootstrap block length in months (1=iid)")
+    parser.add_argument("--date-start", type=str, default=None,
+                        help="Start of date window for historical data (YYYY-MM)")
+    parser.add_argument("--date-end", type=str, default=None,
+                        help="End of date window for historical data (YYYY-MM)")
     parser.add_argument("--jobs", type=int, default=None,
                         help="Parallel workers (-1 = all cores)")
     parser.add_argument("-o", "--output", type=str, default=None,
@@ -54,6 +58,10 @@ def main() -> None:
         kwargs["horizon_years"] = args.horizon
     if args.block_size is not None:
         kwargs["block_size"] = args.block_size
+    if args.date_start is not None:
+        kwargs["date_start"] = args.date_start
+    if args.date_end is not None:
+        kwargs["date_end"] = args.date_end
     if args.jobs is not None:
         kwargs["n_jobs"] = args.jobs
     if args.output is not None:

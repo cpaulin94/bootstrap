@@ -73,12 +73,17 @@ def run_bootstrap(
     block_size: int        = cfg.BLOCK_SIZE,
     use_after_ter: bool    = cfg.USE_AFTER_TER_RETURNS,
     random_seed: Optional[int] = cfg.RANDOM_SEED,
+    date_start: Optional[str]  = cfg.DATE_START,
+    date_end: Optional[str]    = cfg.DATE_END,
 ) -> dict:
     """Full pipeline: load data → simulate → compute metrics → return dict."""
     horizon_months = horizon_years * cfg.MONTHS_PER_YEAR
     rng = np.random.default_rng(random_seed)
 
-    weights, ret_matrix = load_all_returns(portfolio, use_after_ter)
+    weights, ret_matrix = load_all_returns(
+        portfolio, use_after_ter,
+        date_start=date_start, date_end=date_end,
+    )
     paths = simulate(weights, ret_matrix, n_sim, horizon_months, rng,
                      block_size=block_size)
     metrics = compute_metrics(paths, horizon_years, horizon_months,
@@ -90,6 +95,8 @@ def run_bootstrap(
     metrics["block_size"]        = block_size
     metrics["use_after_ter"]     = use_after_ter
     metrics["n_months_history"]  = ret_matrix.shape[0]
+    metrics["date_start"]        = date_start or ""
+    metrics["date_end"]          = date_end or ""
 
     return metrics
 
@@ -138,6 +145,8 @@ def run_multi_bootstrap(
     n_jobs: int             = cfg.N_JOBS,
     output_path: str        = cfg.RESULTS_FILE,
     metrics_to_save: list[str] | None = cfg.METRICS_TO_SAVE,
+    date_start: Optional[str] = cfg.DATE_START,
+    date_end: Optional[str]   = cfg.DATE_END,
 ) -> str:
     """Run the full multi-bootstrap pipeline. Returns the output CSV path."""
 
@@ -147,8 +156,14 @@ def run_multi_bootstrap(
     print(f"Search space: {len(tickers)} tickers  {tickers}")
 
     # ── 2. pre-load return data ───────────────────────────────────────────
-    sorted_tickers, ret_matrix = preload_returns(tickers, use_after_ter)
-    print(f"Return matrix: {ret_matrix.shape[0]} months × {ret_matrix.shape[1]} assets")
+    sorted_tickers, ret_matrix = preload_returns(
+        tickers, use_after_ter,
+        date_start=date_start, date_end=date_end,
+    )
+    date_info = ""
+    if date_start or date_end:
+        date_info = f"  (filtered: {date_start or '…'} → {date_end or '…'})"
+    print(f"Return matrix: {ret_matrix.shape[0]} months × {ret_matrix.shape[1]} assets{date_info}")
 
     # ── 3. generate candidate portfolios ──────────────────────────────────
     rng = np.random.default_rng()
