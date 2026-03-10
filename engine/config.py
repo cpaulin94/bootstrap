@@ -17,9 +17,10 @@ import os
 
 BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 DATA_DIR     = os.path.join(BASE_DIR, "data")
-STANDARD_DIR = os.path.join(DATA_DIR, "standard")
-RAW_DIR      = os.path.join(DATA_DIR, "raw_curvo")
-TER_FILE     = os.path.join(DATA_DIR, "TER_table.csv")
+STANDARD_DIR  = os.path.join(DATA_DIR, "standard")
+RAW_DIR       = os.path.join(DATA_DIR, "raw_curvo")
+RAW_MSCI_DIR  = os.path.join(DATA_DIR, "raw_msci")
+TER_FILE      = os.path.join(DATA_DIR, "TER_table.csv")
 RESULTS_DIR  = os.path.join(BASE_DIR, "results")
 RESULTS_FILE = os.path.join(RESULTS_DIR, "multi_bootstrap_results.csv")
 

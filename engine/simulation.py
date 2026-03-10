@@ -26,18 +26,28 @@ def _precompute_block_gross(
     block_gross : (n_blocks_available,)
         One entry per overlapping block in the historical data.
     """
-    port_monthly = returns @ weights             # (T,)
+    # Apple Accelerate BLAS on aarch64 emits spurious divide-by-zero /
+    # overflow / invalid-value warnings during SIMD-vectorised matmul
+    # even when all inputs are finite and the results are correct.
+    # Verified: row-by-row matmul produces 0 warnings; only the batched
+    # BLAS path triggers them.  Safe to suppress here.
     with np.errstate(all="ignore"):
-        gross_monthly = 1.0 + port_monthly       # (T,)
+        port_monthly = returns @ weights         # (T,)
+    gross_monthly = 1.0 + port_monthly           # (T,)
     T = len(gross_monthly)
     n_blocks = T - block_size + 1
 
-    # Efficient rolling product via cumulative product + division
-    cum = np.cumprod(gross_monthly)               # (T,)
+    # Log-space rolling product avoids cumulative-product overflow.
+    # Instead of  cum = cumprod(gross)  which can overflow to inf for
+    # long series, we compute  cum_log = cumsum(log(gross))  and only
+    # exponentiate the block-sized differences.  This stays finite as
+    # long as no single gross return is <= 0  (i.e. monthly loss < 100%).
+    log_gross = np.log(gross_monthly)             # (T,)
+    cum_log = np.cumsum(log_gross)                # (T,)
     block_gross = np.empty(n_blocks, dtype=np.float64)
-    block_gross[0] = cum[block_size - 1]
+    block_gross[0] = np.exp(cum_log[block_size - 1])
     if n_blocks > 1:
-        block_gross[1:] = cum[block_size:] / cum[:n_blocks - 1]
+        block_gross[1:] = np.exp(cum_log[block_size:] - cum_log[:n_blocks - 1])
 
     return block_gross
 

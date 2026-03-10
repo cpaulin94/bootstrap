@@ -9,6 +9,9 @@ Public API
     run_bootstrap_preloaded(weights, ret_matrix, ...) -> dict
         Fast path for repeated calls with pre-loaded data.
 
+    run_multi_streaming(...) -> tuple
+        Callback-driven multi-bootstrap with cancellation support.
+
     run_multi_bootstrap(...) -> str
         Mass search: generate portfolios → parallel bootstrap → save CSV.
 """
@@ -18,9 +21,10 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import threading
 import time
 from multiprocessing import Pool, cpu_count
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -112,6 +116,8 @@ _W_PARAMS: dict = {}
 
 def _init_worker(ret_matrix: np.ndarray, params: dict) -> None:
     """Initialiser called once per worker process."""
+    import warnings
+    warnings.filterwarnings("ignore")          # suppress BLAS RuntimeWarnings
     global _W_RET_MATRIX, _W_PARAMS
     _W_RET_MATRIX = ret_matrix
     _W_PARAMS = params
@@ -133,6 +139,146 @@ def _eval_portfolio(weights: np.ndarray) -> dict:
     )
 
 
+def _eval_portfolio_with_weights(weights: np.ndarray) -> dict:
+    """Like _eval_portfolio but attaches the weight vector to the result dict.
+
+    Defined here (not in gui.py) so that multiprocessing 'spawn' workers
+    only need to import this lightweight module, not the heavy GUI module.
+    """
+    m = _eval_portfolio(weights)
+    m["_weights"] = weights.tolist()
+    return m
+
+
+def run_multi_streaming(
+    space: list[dict],
+    *,
+    method: str             = cfg.SEARCH_METHOD,
+    n_portfolios: int       = cfg.N_PORTFOLIOS,
+    grid_step: float        = cfg.GRID_STEP,
+    n_sim: int              = cfg.N_SIMULATIONS,
+    horizon_years: int      = cfg.HORIZON_YEARS,
+    block_size: int         = cfg.BLOCK_SIZE,
+    use_after_ter: bool     = cfg.USE_AFTER_TER_RETURNS,
+    n_jobs: int             = cfg.N_JOBS,
+    date_start: Optional[str] = cfg.DATE_START,
+    date_end: Optional[str]   = cfg.DATE_END,
+    seed: Optional[int]     = None,
+    flush_every: int        = 500,
+    return_weights: bool    = False,
+    on_start: Optional[Callable[[list[str], int], None]] = None,
+    on_batch: Optional[Callable[[list[dict], int, int, float], None]] = None,
+    on_done: Optional[Callable[[int, float, float], None]] = None,
+    on_error: Optional[Callable[[str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> tuple[list[str], list[dict]]:
+    """Streaming multi-bootstrap — the shared engine for CLI and GUI.
+
+    Parameters
+    ----------
+    space : list[dict]
+        Search space, each dict has keys: ticker, lo, hi.
+    on_start(sorted_tickers, total) :
+        Called once after data is loaded and portfolios are generated.
+    on_batch(results, n_done, total, speed) :
+        Called every *flush_every* completed portfolios.
+    on_done(n_done, elapsed, avg_speed) :
+        Called when all portfolios are evaluated.
+    on_error(message) :
+        Called on failure.
+    stop_event :
+        Set this ``threading.Event`` to request early termination.
+    return_weights :
+        If True, each result dict includes ``_weights`` (list[float]).
+
+    Returns
+    -------
+    (sorted_tickers, all_results) — the ordered ticker list and list of
+    metric dicts.  Empty on error / early stop.
+    """
+    try:
+        # ── 1. pre-load return data ───────────────────────────────────────
+        tickers = [s["ticker"] for s in space]
+        sorted_tickers, ret_matrix = preload_returns(
+            tickers, use_after_ter,
+            date_start=date_start, date_end=date_end,
+        )
+
+        # ── 2. generate candidate portfolios ──────────────────────────────
+        rng = np.random.default_rng(seed)
+        if method == "random":
+            portfolios = sample_random_portfolios(space, n_portfolios, rng)
+        elif method == "grid":
+            portfolios = sample_grid_portfolios(space, grid_step)
+        else:
+            raise ValueError(f"Unknown search method: {method!r}")
+
+        if len(portfolios) == 0:
+            if on_error:
+                on_error("No valid portfolios generated.")
+            return sorted_tickers, []
+
+        # reorder columns to match sorted_tickers
+        ticker_order = [tickers.index(t) for t in sorted_tickers]
+        portfolios = portfolios[:, ticker_order]
+        total = len(portfolios)
+
+        if on_start:
+            on_start(sorted_tickers, total)
+
+        # ── 3. run bootstraps in parallel ─────────────────────────────────
+        n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
+        params = dict(
+            n_sim=n_sim,
+            horizon_years=horizon_years,
+            block_size=block_size,
+            percentiles=cfg.RETURN_PERCENTILES,
+            vol_windows=cfg.VOLATILITY_WINDOWS,
+            bad_pct=cfg.BAD_PERCENTILE,
+        )
+
+        eval_fn = _eval_portfolio_with_weights if return_weights else _eval_portfolio
+        chunksize = max(1, min(64, total // (n_workers * 4)))
+
+        all_results: list[dict] = []
+        t_start = time.perf_counter()
+        batch_buf: list[dict] = []
+        batch_t0 = time.perf_counter()
+
+        with Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(ret_matrix, params),
+        ) as pool:
+            for m in pool.imap_unordered(eval_fn, portfolios, chunksize=chunksize):
+                if stop_event and stop_event.is_set():
+                    pool.terminate()
+                    break
+
+                all_results.append(m)
+                batch_buf.append(m)
+
+                if len(batch_buf) >= flush_every or len(all_results) == total:
+                    batch_elapsed = time.perf_counter() - batch_t0
+                    speed = len(batch_buf) / max(batch_elapsed, 1e-6)
+                    if on_batch:
+                        on_batch(list(batch_buf), len(all_results), total, speed)
+                    batch_buf = []
+                    batch_t0 = time.perf_counter()
+
+        elapsed = time.perf_counter() - t_start
+        avg_speed = len(all_results) / max(elapsed, 1e-6)
+        if on_done:
+            on_done(len(all_results), elapsed, avg_speed)
+
+        return sorted_tickers, all_results
+
+    except Exception as exc:
+        if on_error:
+            on_error(str(exc))
+        return [], []
+
+
 def run_multi_bootstrap(
     search_csv: str         = cfg.SEARCH_CSV,
     method: str             = cfg.SEARCH_METHOD,
@@ -148,73 +294,58 @@ def run_multi_bootstrap(
     date_start: Optional[str] = cfg.DATE_START,
     date_end: Optional[str]   = cfg.DATE_END,
 ) -> str:
-    """Run the full multi-bootstrap pipeline. Returns the output CSV path."""
+    """Run the full multi-bootstrap pipeline. Returns the output CSV path.
 
-    # ── 1. search space ───────────────────────────────────────────────────
+    This is a thin CLI wrapper around :func:`run_multi_streaming` that adds
+    console logging and CSV output.
+    """
     space = load_search_space(search_csv)
     tickers = [s["ticker"] for s in space]
+    n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
     print(f"Search space: {len(tickers)} tickers  {tickers}")
 
-    # ── 2. pre-load return data ───────────────────────────────────────────
-    sorted_tickers, ret_matrix = preload_returns(
-        tickers, use_after_ter,
-        date_start=date_start, date_end=date_end,
-    )
-    date_info = ""
-    if date_start or date_end:
-        date_info = f"  (filtered: {date_start or '…'} → {date_end or '…'})"
-    print(f"Return matrix: {ret_matrix.shape[0]} months × {ret_matrix.shape[1]} assets{date_info}")
+    # Store portfolios for CSV output (closure variable)
+    _portfolios_ref: list[np.ndarray] = []
 
-    # ── 3. generate candidate portfolios ──────────────────────────────────
-    rng = np.random.default_rng()
-    if method == "random":
-        portfolios = sample_random_portfolios(space, n_portfolios, rng)
-        print(f"Sampled {len(portfolios)} random portfolios")
-    elif method == "grid":
-        portfolios = sample_grid_portfolios(space, grid_step)
-        print(f"Generated {len(portfolios)} grid portfolios (step={grid_step})")
-    else:
-        raise ValueError(f"Unknown search method: {method!r}")
+    def _on_start(sorted_tickers, total):
+        print(f"Return matrix loaded.  {total} portfolios to evaluate.")
+        print(f"Running {total} bootstraps "
+              f"({n_sim} sims × {horizon_years}y, block={block_size}m) "
+              f"on {n_workers} cores...")
 
-    if len(portfolios) == 0:
-        print("No valid portfolios found. Check search space constraints.")
-        sys.exit(1)
+    def _on_done(n_done, elapsed, avg_speed):
+        print(f"Done in {elapsed:.1f}s  ({avg_speed:.0f} portfolios/s)")
 
-    # reorder columns to match sorted_tickers
-    ticker_order = [tickers.index(t) for t in sorted_tickers]
-    portfolios = portfolios[:, ticker_order]
+    def _on_error(msg):
+        print(f"ERROR: {msg}", file=sys.stderr)
 
-    # ── 4. run bootstraps in parallel ─────────────────────────────────────
-    n_workers = cpu_count() if n_jobs == -1 else n_jobs
-    params = dict(
+    sorted_tickers, all_metrics = run_multi_streaming(
+        space,
+        method=method,
+        n_portfolios=n_portfolios,
+        grid_step=grid_step,
         n_sim=n_sim,
         horizon_years=horizon_years,
         block_size=block_size,
-        percentiles=cfg.RETURN_PERCENTILES,
-        vol_windows=cfg.VOLATILITY_WINDOWS,
-        bad_pct=cfg.BAD_PERCENTILE,
+        use_after_ter=use_after_ter,
+        n_jobs=n_jobs,
+        date_start=date_start,
+        date_end=date_end,
+        flush_every=max(1, n_portfolios),  # single batch → same as pool.map
+        return_weights=True,               # need weights for CSV
+        on_start=_on_start,
+        on_done=_on_done,
+        on_error=_on_error,
     )
 
-    print(f"Running {len(portfolios)} bootstraps "
-          f"({n_sim} sims × {horizon_years}y, block={block_size}m) "
-          f"on {n_workers} cores...")
-    t0 = time.perf_counter()
+    if not all_metrics:
+        print("No results produced.")
+        sys.exit(1)
 
-    with Pool(
-        processes=n_workers,
-        initializer=_init_worker,
-        initargs=(ret_matrix, params),
-    ) as pool:
-        all_metrics = pool.map(_eval_portfolio, portfolios, chunksize=16)
-
-    elapsed = time.perf_counter() - t0
-    rate = len(portfolios) / elapsed
-    print(f"Done in {elapsed:.1f}s  ({rate:.0f} portfolios/s)")
-
-    # ── 5. assemble and save results ──────────────────────────────────────
+    # ── assemble and save results ─────────────────────────────────────────
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    metric_keys = sorted(all_metrics[0].keys())
+    metric_keys = sorted(k for k in all_metrics[0].keys() if not k.startswith("_"))
     if metrics_to_save is not None:
         metric_keys = [k for k in metric_keys if k in metrics_to_save]
 
@@ -223,9 +354,10 @@ def run_multi_bootstrap(
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for weights, mdict in zip(portfolios, all_metrics):
+        for mdict in all_metrics:
+            weights = mdict.get("_weights", [])
             row = [round(w, 6) for w in weights] + [mdict.get(k, "") for k in metric_keys]
             writer.writerow(row)
 
-    print(f"Results saved → {output_path}  ({len(portfolios)} rows × {len(header)} cols)")
+    print(f"Results saved → {output_path}  ({len(all_metrics)} rows × {len(header)} cols)")
     return output_path
