@@ -19,6 +19,14 @@ from engine.runner import (
 )
 from engine.metrics import compute_metrics, shannon_entropy
 from engine.pareto import compute_pareto
+from engine.lifecycle import (
+    LifePlan,
+    LifeSimResult,
+    LumpSum,
+    Phase,
+    PhaseKind,
+    simulate_life_strategy,
+)
 
 __all__ = [
     "load_portfolio_csv",
@@ -30,4 +38,10 @@ __all__ = [
     "compute_metrics",
     "shannon_entropy",
     "compute_pareto",
+    "LifePlan",
+    "LifeSimResult",
+    "LumpSum",
+    "Phase",
+    "PhaseKind",
+    "simulate_life_strategy",
 ]

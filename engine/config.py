@@ -75,7 +75,7 @@ PARETO_METRICS: list[dict] = [
     {"name": "annualised_return_p1",               "direction": "maximize"},
     {"name": f"volatility_{VOLATILITY_WINDOWS[-1]}y", "direction": "minimize"},
     {"name": f"max_dd_depth_p{_bp}",               "direction": "minimize"},
-    {"name": f"shannon_entropy",               "direction": "maximize"},
+    {"name": "type_entropy",                "direction": "maximize"},
     
 ]
 
@@ -84,3 +84,13 @@ PARETO_METRICS: list[dict] = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 N_JOBS: int = -1  # -1 = all CPU cores
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Life Strategy Simulator defaults
+# ═══════════════════════════════════════════════════════════════════════════════
+
+LIFE_TAX_RATE_PCT: float = 26.0        # capital-gains tax on realised gains
+LIFE_INITIAL_CAPITAL: float = 100_000.0
+LIFE_INFLATION_PCT: float = 2.0
+LIFE_N_SIM: int = 5_000
+LIFE_BLOCK_MONTHS: int = 12

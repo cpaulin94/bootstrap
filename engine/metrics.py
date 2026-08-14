@@ -19,6 +19,38 @@ from engine import config as cfg
 # Weight-based metrics  (no simulation required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def type_entropy(weights: np.ndarray, tickers: list[str]) -> float:
+    """Normalised Shannon entropy across asset-class *types*.
+
+    Weights are aggregated by TYPE (from TER_table.csv), then the standard
+    normalised Shannon entropy is computed on the type-level weight vector:
+
+        H = -Σ wₜ·ln(wₜ)  (for wₜ > 0)
+        H_norm = H / ln(N_types)  ∈ [0, 1]
+
+    Returns 0.0 when only one type is present, 1.0 for equal type weights.
+    Tickers missing from the type map are grouped under "UNKNOWN".
+    """
+    from engine.data import load_type_map
+
+    type_map = load_type_map()
+    w = np.asarray(weights, dtype=np.float64)
+
+    # aggregate weights by type
+    type_weights: dict[str, float] = {}
+    for i, ticker in enumerate(tickers):
+        t = type_map.get(ticker.upper(), "UNKNOWN")
+        type_weights[t] = type_weights.get(t, 0.0) + w[i]
+
+    tw = np.array(list(type_weights.values()), dtype=np.float64)
+    n = len(tw)
+    if n <= 1:
+        return 0.0
+    tw_nz = tw[tw > 0]
+    h = -float(np.sum(tw_nz * np.log(tw_nz)))
+    return round(h / np.log(n), 6)
+
+
 def shannon_entropy(weights: np.ndarray) -> float:
     """Normalised Shannon entropy of a weight vector.
 
@@ -111,30 +143,39 @@ def _max_drawdown_depth(dd: np.ndarray, bad_pct: float) -> float:
     return round(float(np.percentile(worst_per_sim, 100 - bad_pct)), 6)
 
 
+def _last_reset_index(in_dd: np.ndarray) -> np.ndarray:
+    """For each column *t*, the index of the most recent ``False`` at or
+    before *t* (or ``-1`` if none exists yet).
+
+    Vectorised "reset" trick: replacing ``True`` entries with ``-1`` and
+    ``False`` entries with their own column index, then taking a running
+    max, produces exactly this — because a running max over indices only
+    ever advances at a ``False`` (reset) position.
+    """
+    n_sim, T = in_dd.shape
+    idx = np.arange(T)[None, :]
+    reset_idx = np.where(in_dd, -1, idx)
+    return np.maximum.accumulate(reset_idx, axis=1)
+
+
 def _max_drawdown_length(paths: np.ndarray, bad_pct: float, block_size: int = 1) -> int:
     """Longest drawdown (months) at the bad percentile.
 
     When *block_size* > 1, each path step spans *block_size* months, so
     the raw step count is multiplied by *block_size* to report months.
+
+    Vectorised: for a run ending at column *t*, its length is
+    ``t - last_reset[t]`` where *last_reset* is the last ``False`` column
+    at or before *t* (see :func:`_last_reset_index`).
     """
     running_max = np.maximum.accumulate(paths, axis=1)
     in_dd = paths < running_max
 
-    n_sim = in_dd.shape[0]
-    max_lengths = np.zeros(n_sim, dtype=np.int64)
-
-    for i in range(n_sim):
-        row = in_dd[i]
-        length = 0
-        best = 0
-        for v in row:
-            if v:
-                length += 1
-                if length > best:
-                    best = length
-            else:
-                length = 0
-        max_lengths[i] = best
+    T = in_dd.shape[1]
+    idx = np.arange(T)[None, :]
+    last_reset = _last_reset_index(in_dd)
+    run_length = np.where(in_dd, idx - last_reset, 0)
+    max_lengths = run_length.max(axis=1)
 
     steps = int(np.percentile(max_lengths, 100 - bad_pct))
     return steps * block_size
@@ -147,28 +188,24 @@ def _max_drawdown_area(
 
     When *block_size* > 1 each step spans *block_size* months, so the
     raw area is multiplied by *block_size* to remain in month-units.
+
+    Vectorised: the sum of *dd* over the run ending at column *t* is a
+    "cumulative sum that resets at each False" — computed as the global
+    cumsum at *t* minus the global cumsum at *last_reset[t]* (padded with
+    a leading zero so ``last_reset == -1`` maps cleanly to "no prior sum").
     """
     running_max = np.maximum.accumulate(paths, axis=1)
     in_dd = paths < running_max
 
     n_sim = in_dd.shape[0]
-    mda_per_sim = np.zeros(n_sim, dtype=np.float64)
+    last_reset = _last_reset_index(in_dd)
 
-    for i in range(n_sim):
-        row_dd = dd[i]
-        row_in = in_dd[i]
-        best_area = 0.0
-        current_area = 0.0
-        for t in range(len(row_in)):
-            if row_in[t]:
-                current_area += row_dd[t]
-            else:
-                if current_area > best_area:
-                    best_area = current_area
-                current_area = 0.0
-        if current_area > best_area:
-            best_area = current_area
-        mda_per_sim[i] = best_area
+    cumsum = np.cumsum(dd, axis=1)
+    padded = np.concatenate([np.zeros((n_sim, 1), dtype=cumsum.dtype), cumsum], axis=1)
+    start_vals = np.take_along_axis(padded, last_reset + 1, axis=1)
+
+    run_sum = np.where(in_dd, cumsum - start_vals, 0.0)
+    mda_per_sim = run_sum.max(axis=1)
 
     raw = float(np.percentile(mda_per_sim, 100 - bad_pct))
     return round(raw * block_size, 6)
@@ -187,6 +224,7 @@ def compute_metrics(
     vol_windows: list[int] = cfg.VOLATILITY_WINDOWS,
     bad_pct: float         = cfg.BAD_PERCENTILE,
     weights: Optional[np.ndarray] = None,
+    tickers: Optional[list[str]] = None,
 ) -> dict:
     """Compute all metrics on the simulated paths matrix.
 
@@ -195,12 +233,16 @@ def compute_metrics(
     back to calendar-month units automatically.
 
     If *weights* is provided, Shannon entropy is included (no bootstrap needed).
+    If *tickers* is also provided, type entropy (diversification across
+    asset-class types) is included as well.
     """
     metrics: dict = {}
 
     # ── weight-based metrics ──────────────────────────────────────────────
     if weights is not None:
         metrics["shannon_entropy"] = shannon_entropy(weights)
+        if tickers is not None:
+            metrics["type_entropy"] = type_entropy(weights, tickers)
 
     # ── simulation-based metrics ──────────────────────────────────────────
     metrics.update(_annualised_return_percentiles(paths, horizon_years, percentiles))

@@ -3,20 +3,26 @@
 Bootstrap Portfolio Analyser — Tkinter GUI
 ===========================================
 A production-quality desktop application wrapping the bootstrap codebase
-into a multi-panel interface with three sections:
+into a multi-panel interface with four sections:
 
   1. Portfolio Builder
   2. Portfolio Space Explorer (multi-bootstrap)
   3. Single Bootstrap Analysis
+  4. Life Strategy Simulator (bootstrap_gui.sections.lifecycle)
+
+Shared theming, widgets, background-job threading, and persistence live in
+the ``bootstrap_gui`` package; this module still hosts the three original
+sections plus the application shell.
 
 Launch:
-    python gui.py
+    uv run main.py
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import queue
 import threading
@@ -26,7 +32,7 @@ import http.server
 import socketserver
 import webbrowser
 from multiprocessing import cpu_count
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, simpledialog
 from typing import Optional
 
 import numpy as np
@@ -48,13 +54,14 @@ sys.path.insert(0, BASE_DIR)
 
 from engine import config as cfg
 from engine.data import (
-    _load_returns,
-    _apply_date_filter,
-    _parse_month_year,
+    load_returns,
+    apply_date_filter,
+    parse_month_year,
     load_all_returns,
+    load_independent_returns,
     load_portfolio_csv,
 )
-from engine.metrics import compute_metrics, shannon_entropy
+from engine.metrics import compute_metrics, shannon_entropy, type_entropy
 from engine.pareto import compute_pareto
 from engine.runner import (
     run_bootstrap,
@@ -62,309 +69,31 @@ from engine.runner import (
     run_multi_streaming,
 )
 from engine.search import load_search_space
-from engine.simulation import simulate
+from engine.simulation import simulate, simulate_independent
+
+from bootstrap_gui import theme
+from bootstrap_gui.theme import (
+    BG, PANEL_BG, TEXT, TEXT_SEC, ACCENT, POSITIVE, WARNING, CRIMSON,
+    SCATTER_DOT, GRID_CLR, BORDER, HOVER_BG, PAD,
+    apply_style, make_figure,
+)
+from bootstrap_gui.widgets import StyledButton, FieldLabel, NumericEntry, ErrorLabel
+from bootstrap_gui.library import PortfolioLibrary
+from bootstrap_gui.logsetup import gui_log_queue as _gui_log_queue, setup_logging
+from bootstrap_gui.assets import (
+    get_available_assets,
+    compute_date_intersection,
+    clean_portfolio as _clean_portfolio,
+    build_metric_list as _build_metric_list,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DESIGN TOKENS
+# LOGGING SETUP — verbose terminal + GUI forwarding
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BG = "#F5F5F0"
-PANEL_BG = "#FFFFFF"
-TEXT = "#1A1A1A"
-TEXT_SEC = "#888888"
-ACCENT = "#1A1A1A"
-POSITIVE = "#2D6A4F"
-WARNING = "#C0392B"
-CRIMSON = "#C0392B"
-SCATTER_DOT = "#4A4A4A"
-GRID_CLR = "#E0E0DA"
-BORDER = "#DADAD4"
-HOVER_BG = "#1A1A1A"
-
-FONT_FAMILY = ("Helvetica Neue", "Helvetica", "Arial Narrow", "Arial")
-FONT_LIGHT = (FONT_FAMILY[0], 10)
-FONT_REG = (FONT_FAMILY[0], 11)
-FONT_MED = (FONT_FAMILY[0], 12, "bold")
-FONT_LABEL = (FONT_FAMILY[0], 9)
-FONT_LABEL_UP = (FONT_FAMILY[0], 8)
-FONT_MONO = ("Menlo", "Courier New", "Courier")
-FONT_SMALL = (FONT_FAMILY[0], 9)
-
-PAD = 6
-
-PLOT_DPI = 150  # Higher DPI for crisp plots
-
-
-def _label_text(s: str) -> str:
-    """Convert label to uppercase tracked style."""
-    return s.upper()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MATPLOTLIB STYLE HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def apply_style(ax: plt.Axes, title: str = ""):
-    """Apply Swiss-scientific style to axes."""
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["bottom"].set_color(TEXT)
-    ax.spines["bottom"].set_linewidth(0.5)
-    ax.spines["left"].set_color(TEXT)
-    ax.spines["left"].set_linewidth(0.5)
-    ax.set_facecolor(PANEL_BG)
-    ax.tick_params(
-        direction="out", length=3, width=0.5, colors=TEXT, labelsize=9
-    )
-    ax.grid(True, color=GRID_CLR, linewidth=0.5, linestyle="--", alpha=0.8)
-    if title:
-        ax.set_title(title, fontsize=10, fontweight="medium", loc="left", color=TEXT)
-
-
-def make_figure(nrows=1, ncols=1, figsize=(8, 5)):
-    """Create a Figure with the standard facecolor."""
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, dpi=PLOT_DPI)
-    fig.set_facecolor(BG)
-    fig.subplots_adjust(left=0.10, right=0.95, top=0.90, bottom=0.12)
-    return fig, axes
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ASSET DATA HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_available_assets() -> list[dict]:
-    """Enumerate assets in data/standard/, read date ranges."""
-    assets = []
-    for fname in sorted(os.listdir(cfg.STANDARD_DIR)):
-        if not fname.endswith(".csv"):
-            continue
-        ticker = fname.replace(".csv", "")
-        path = os.path.join(cfg.STANDARD_DIR, fname)
-        first_date = last_date = None
-        try:
-            with open(path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-                if rows:
-                    first_date = rows[0]["month_year"].strip()
-                    last_date = rows[-1]["month_year"].strip()
-        except Exception:
-            pass
-        assets.append(
-            {"ticker": ticker, "first_date": first_date or "?", "last_date": last_date or "?"}
-        )
-    return assets
-
-
-def compute_date_intersection(tickers: list[str]) -> tuple[str, str]:
-    """Compute the intersection of date ranges for selected tickers."""
-    if not tickers:
-        return ("", "")
-    latest_start = (0, 0)
-    earliest_end = (9999, 12)
-    for t in tickers:
-        path = os.path.join(cfg.STANDARD_DIR, f"{t}.csv")
-        try:
-            with open(path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-                if rows:
-                    s = _parse_month_year(rows[0]["month_year"])
-                    e = _parse_month_year(rows[-1]["month_year"])
-                    if s > latest_start:
-                        latest_start = s
-                    if e < earliest_end:
-                        earliest_end = e
-        except Exception:
-            pass
-    if latest_start > earliest_end:
-        return ("N/A", "N/A")
-    return (
-        f"{latest_start[0]:04d}-{latest_start[1]:02d}",
-        f"{earliest_end[0]:04d}-{earliest_end[1]:02d}",
-    )
-
-
-def load_asset_returns_with_dates(ticker: str):
-    """Load returns and dates for a single ticker."""
-    dates, ret = _load_returns(ticker, cfg.USE_AFTER_TER_RETURNS)
-    return dates, ret
-
-
-def _clean_portfolio(portfolio: dict) -> dict:
-    """Remove zero-weight assets from portfolio.
-
-    Root cause fix for NumPy matmul warnings: zero-weight entries cause
-    inf*0 or nan*0 inside BLAS routines, triggering spurious
-    'divide by zero / overflow / invalid value in matmul' warnings.
-    Filtering them out is mathematically equivalent and eliminates
-    the warnings at the source.
-    """
-    return {t: w for t, w in portfolio.items() if w > 1e-9}
-
-
-def _build_metric_list() -> list[str]:
-    """Build the metric dropdown list dynamically from engine config.
-
-    This ensures names always match what `compute_metrics` produces,
-    regardless of BAD_PERCENTILE or VOLATILITY_WINDOWS settings.
-    """
-    bp = str(cfg.BAD_PERCENTILE)
-    return (
-        [f"annualised_return_p{p}" for p in cfg.RETURN_PERCENTILES]
-        + [f"volatility_{w}y" for w in cfg.VOLATILITY_WINDOWS]
-        + [
-            f"max_dd_depth_p{bp}",
-            f"max_dd_length_months_p{bp}",
-            f"mda_months_p{bp}",
-        ]
-        + ["shannon_entropy"]
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PORTFOLIO LIBRARY
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class PortfolioLibrary:
-    """In-memory portfolio library with optional JSON persistence."""
-
-    _FILE = os.path.join(BASE_DIR, ".portfolio_library.json")
-
-    def __init__(self):
-        self.portfolios: dict[str, dict[str, float]] = {}
-        self._callbacks: list = []
-        self._load()
-
-    def _load(self):
-        if os.path.exists(self._FILE):
-            try:
-                with open(self._FILE, "r") as f:
-                    self.portfolios = json.load(f)
-            except Exception:
-                self.portfolios = {}
-
-    def _save(self):
-        try:
-            with open(self._FILE, "w") as f:
-                json.dump(self.portfolios, f, indent=2)
-        except Exception:
-            pass
-
-    def add(self, name: str, weights: dict[str, float]):
-        self.portfolios[name] = weights
-        self._save()
-        self._notify()
-
-    def delete(self, name: str):
-        self.portfolios.pop(name, None)
-        self._save()
-        self._notify()
-
-    def rename(self, old: str, new: str):
-        if old in self.portfolios:
-            self.portfolios[new] = self.portfolios.pop(old)
-            self._save()
-            self._notify()
-
-    def names(self) -> list[str]:
-        return list(self.portfolios.keys())
-
-    def get(self, name: str) -> dict[str, float]:
-        return self.portfolios.get(name, {})
-
-    def on_change(self, cb):
-        self._callbacks.append(cb)
-
-    def _notify(self):
-        for cb in self._callbacks:
-            try:
-                cb()
-            except Exception:
-                pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STYLED WIDGETS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class StyledButton(tk.Button):
-    """Rectangular, 1px border, uppercase — inverts on hover."""
-
-    def __init__(self, parent, text="", command=None, **kw):
-        super().__init__(
-            parent,
-            text=text.upper(),
-            command=command,
-            font=(FONT_FAMILY[0], 9),
-            bg=PANEL_BG,
-            fg=TEXT,
-            activebackground=ACCENT,
-            activeforeground=PANEL_BG,
-            bd=1,
-            relief="solid",
-            highlightthickness=0,
-            padx=10,
-            pady=4,
-            cursor="hand2",
-            **kw,
-        )
-        self.bind("<Enter>", lambda e: self.config(bg=ACCENT, fg=PANEL_BG))
-        self.bind("<Leave>", lambda e: self.config(bg=PANEL_BG, fg=TEXT))
-
-
-class FieldLabel(tk.Label):
-    """Uppercase label for form fields."""
-
-    def __init__(self, parent, text="", **kw):
-        super().__init__(
-            parent,
-            text=_label_text(text),
-            font=(FONT_FAMILY[0], 8),
-            fg=TEXT_SEC,
-            bg=kw.pop("bg", PANEL_BG),
-            anchor="w",
-            **kw,
-        )
-
-
-class NumericEntry(tk.Entry):
-    """Entry that only accepts numeric input."""
-
-    def __init__(self, parent, **kw):
-        super().__init__(
-            parent,
-            font=(FONT_FAMILY[0], 10),
-            bg=PANEL_BG,
-            fg=TEXT,
-            bd=1,
-            relief="solid",
-            highlightthickness=0,
-            **kw,
-        )
-
-
-class ErrorLabel(tk.Label):
-    """Inline error message in WARNING color."""
-
-    def __init__(self, parent, **kw):
-        super().__init__(
-            parent,
-            text="",
-            font=(FONT_FAMILY[0], 8),
-            fg=WARNING,
-            bg=kw.pop("bg", PANEL_BG),
-            anchor="w",
-            **kw,
-        )
-
-    def show(self, msg: str):
-        self.config(text=msg)
-
-    def clear(self):
-        self.config(text="")
+setup_logging()
+_gui_log = logging.getLogger("bootstrap.gui")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -443,15 +172,14 @@ class PortfolioBuilderSection(tk.Frame):
         top = tk.Frame(frame, bg=PANEL_BG)
         top.pack(fill="x", padx=PAD, pady=(PAD, 0))
         FieldLabel(top, text="Current Portfolio", bg=PANEL_BG).pack(side="left")
-        self.remaining_label = tk.Label(
-            top, text="REMAINING: 100.0%", font=(FONT_FAMILY[0], 9, "bold"),
-            fg=WARNING, bg=PANEL_BG
+        self.remaining_label = ttk.Label(
+            top, text="REMAINING: 100.0%", style="Card.TLabel",
+            font=(theme.FONT_FAMILY[0], 9, "bold"), foreground=WARNING,
         )
         self.remaining_label.pack(side="right")
 
-        self.date_range_label = tk.Label(
-            frame, text="GLOBAL DATE RANGE: —",
-            font=(FONT_FAMILY[0], 8), fg=TEXT_SEC, bg=PANEL_BG, anchor="w"
+        self.date_range_label = ttk.Label(
+            frame, text="GLOBAL DATE RANGE: —", style="Field.Card.TLabel", anchor="w",
         )
         self.date_range_label.pack(fill="x", padx=PAD, pady=(2, 4))
 
@@ -471,10 +199,7 @@ class PortfolioBuilderSection(tk.Frame):
 
         btn_row = tk.Frame(frame, bg=PANEL_BG)
         btn_row.pack(fill="x", padx=PAD, pady=(0, PAD))
-        self.name_entry = tk.Entry(
-            btn_row, font=(FONT_FAMILY[0], 10), width=18, bd=1, relief="solid",
-            bg=PANEL_BG, fg=TEXT
-        )
+        self.name_entry = ttk.Entry(btn_row, font=(theme.FONT_FAMILY[0], 10), width=18)
         self.name_entry.insert(0, "My Portfolio")
         self.name_entry.pack(side="left", padx=(0, 4))
         StyledButton(btn_row, text="Save to Library", command=self._save_portfolio).pack(
@@ -490,7 +215,7 @@ class PortfolioBuilderSection(tk.Frame):
         FieldLabel(frame, text="Correlation Heatmap", bg=PANEL_BG).pack(
             anchor="w", padx=PAD, pady=(PAD, 0)
         )
-        self.heatmap_fig = Figure(figsize=(4, 3.5), facecolor=BG, dpi=PLOT_DPI)
+        self.heatmap_fig = Figure(figsize=(4, 3.5), facecolor=BG, dpi=theme.PLOT_DPI)
         self.heatmap_ax = self.heatmap_fig.add_subplot(111)
         self.heatmap_canvas = FigureCanvasTkAgg(self.heatmap_fig, master=frame)
         self.heatmap_canvas.get_tk_widget().pack(fill="both", expand=True, padx=PAD, pady=PAD)
@@ -505,7 +230,7 @@ class PortfolioBuilderSection(tk.Frame):
             anchor="w", padx=PAD, pady=(PAD, 0)
         )
         self.library_listbox = tk.Listbox(
-            frame, font=(FONT_FAMILY[0], 10), bg=PANEL_BG, fg=TEXT,
+            frame, font=(theme.FONT_FAMILY[0], 10), bg=PANEL_BG, fg=TEXT,
             selectmode="browse", bd=0, highlightthickness=0, height=6
         )
         self.library_listbox.pack(fill="both", expand=True, padx=PAD, pady=2)
@@ -543,19 +268,15 @@ class PortfolioBuilderSection(tk.Frame):
         row_frame = tk.Frame(self.portfolio_inner, bg=PANEL_BG)
         row_frame.pack(fill="x", padx=2, pady=1)
 
-        tk.Label(
-            row_frame, text=ticker, font=(FONT_FAMILY[0], 10, "bold"),
-            fg=TEXT, bg=PANEL_BG, width=8, anchor="w"
+        ttk.Label(
+            row_frame, text=ticker, style="Card.TLabel",
+            font=(theme.FONT_FAMILY[0], 10, "bold"), width=8, anchor="w",
         ).pack(side="left")
 
         var = tk.StringVar(value=f"{weight:.1f}")
-        entry = tk.Entry(
-            row_frame, textvariable=var, font=(FONT_MONO[0], 10), width=8,
-            bd=1, relief="solid", bg=PANEL_BG, fg=TEXT
-        )
+        entry = NumericEntry(row_frame, textvariable=var, font=(theme.FONT_MONO[0], 10), width=8)
         entry.pack(side="left", padx=4)
-        tk.Label(row_frame, text="%", font=(FONT_FAMILY[0], 9), fg=TEXT_SEC,
-                 bg=PANEL_BG).pack(side="left")
+        ttk.Label(row_frame, text="%", style="Field.Card.TLabel").pack(side="left")
         var.trace_add("write", lambda *_: self._update_portfolio_state())
 
         def remove(t=ticker, f=row_frame):
@@ -575,7 +296,7 @@ class PortfolioBuilderSection(tk.Frame):
                 pass
         remaining = 100.0 - total
         color = POSITIVE if abs(remaining) < 0.01 else WARNING
-        self.remaining_label.config(text=f"REMAINING: {remaining:+.1f}%", fg=color)
+        self.remaining_label.config(text=f"REMAINING: {remaining:+.1f}%", foreground=color)
 
         tickers = [a["ticker"] for a in self.current_assets]
         if tickers:
@@ -618,11 +339,11 @@ class PortfolioBuilderSection(tk.Frame):
         self.current_assets.clear()
         self._update_portfolio_state()
 
-    def _draw_empty_heatmap(self):
+    def _draw_empty_heatmap(self, message: str = "Add assets to see\ncorrelation heatmap"):
         self.heatmap_ax.clear()
         self.heatmap_ax.set_facecolor(PANEL_BG)
         self.heatmap_ax.text(
-            0.5, 0.5, "Add assets to see\ncorrelation heatmap",
+            0.5, 0.5, message,
             ha="center", va="center", fontsize=9, color=TEXT_SEC,
             transform=self.heatmap_ax.transAxes,
         )
@@ -641,8 +362,8 @@ class PortfolioBuilderSection(tk.Frame):
             ds, de = compute_date_intersection(tickers)
             all_ret = {}
             for t in tickers:
-                dates, ret = _load_returns(t, cfg.USE_AFTER_TER_RETURNS)
-                filtered = _apply_date_filter(dates, ret, ds, de)
+                dates, ret = load_returns(t, cfg.USE_AFTER_TER_RETURNS)
+                filtered = apply_date_filter(dates, ret, ds, de)
                 all_ret[t] = filtered
 
             min_len = min(len(v) for v in all_ret.values())
@@ -670,8 +391,13 @@ class PortfolioBuilderSection(tk.Frame):
                 sp.set_visible(False)
             self.heatmap_fig.tight_layout()
             self.heatmap_canvas.draw_idle()
-        except Exception:
-            self._draw_empty_heatmap()
+        except ValueError as e:
+            # e.g. no overlapping date range across the selected tickers
+            _gui_log.warning("[HEATMAP] %s", e)
+            self._draw_empty_heatmap("Can't compute heatmap:\nno overlapping history\nfor these assets")
+        except (OSError, KeyError) as e:
+            _gui_log.warning("[HEATMAP] %s", e)
+            self._draw_empty_heatmap(f"Can't compute heatmap:\n{e}")
 
     def _refresh_library_list(self):
         self.library_listbox.delete(0, "end")
@@ -739,6 +465,7 @@ class SpaceExplorerSection(tk.Frame):
         library.on_change(self._refresh_space_library_selector)
         self._start_click_server()
         self.after(500, self._poll_clicks)
+        self.after(200, self._poll_engine_logs)
 
     def destroy(self):
         self._destroyed = True
@@ -802,8 +529,13 @@ class SpaceExplorerSection(tk.Frame):
             self._click_server = srv
             t = threading.Thread(target=srv.serve_forever, daemon=True)
             t.start()
-        except Exception:
+        except OSError as e:
             self._click_port = None
+            _gui_log.warning(
+                "[EXPLORER] Click-to-library server could not start (%s) — "
+                "clicking chart points to save them to the library will not work "
+                "this session; charts still open and render normally.", e,
+            )
 
     def _poll_clicks(self):
         """Poll the click queue and handle any portfolio clicks."""
@@ -825,8 +557,9 @@ class SpaceExplorerSection(tk.Frame):
         self.after(300, self._poll_clicks)
 
     def _handle_portfolio_click(self, portfolio: dict):
-        """Prompt the user to name and save a clicked portfolio to the library."""
-        # Build clean float-keyed weights dict from JS customdata
+        """Queue a clicked chart point for the user to name/save at their own
+        pace — never blocks the mainloop with a modal (see comment above
+        ``pending_container`` in ``_build_config_panel``)."""
         weights = {
             k: float(v)
             for k, v in portfolio.items()
@@ -834,19 +567,53 @@ class SpaceExplorerSection(tk.Frame):
         }
         if not weights:
             return
-        preview_lines = [f"{t}: {w:.1%}" for t, w in sorted(weights.items())]
-        preview = "\n".join(preview_lines[:8])
-        if len(preview_lines) > 8:
-            preview += f"\n  …+{len(preview_lines) - 8} more"
-        name = simpledialog.askstring(
-            "Add to Library",
-            f"Portfolio:\n{preview}\n\nEnter a name:",
-            initialvalue="Selected Portfolio",
-            parent=self,
-        )
-        if name and name.strip():
-            self.library.add(name.strip(), weights)
-            self._log(f"Saved '{name.strip()}' to library ({len(weights)} assets)")
+        self._add_pending_selection(weights)
+        self._log(f"Chart point queued ({len(weights)} assets) — "
+                  f"name and save it in the 'Pending Chart Selections' panel.")
+
+    def _add_pending_selection(self, weights: dict[str, float]) -> None:
+        n = len(self._pending_selections) + 1
+        preview = " · ".join(f"{t} {w:.0%}" for t, w in sorted(weights.items()))
+
+        row = tk.Frame(self.pending_container, bg=PANEL_BG, bd=1, relief="solid",
+                       highlightbackground=BORDER, highlightthickness=1)
+        row.pack(fill="x", pady=2)
+
+        ttk.Label(row, text=preview, style="Field.Card.TLabel", wraplength=260,
+                  justify="left").pack(anchor="w", padx=4, pady=(4, 2))
+
+        name_row = tk.Frame(row, bg=PANEL_BG)
+        name_row.pack(fill="x", padx=4, pady=(0, 4))
+        name_var = tk.StringVar(value=f"Selected Portfolio {n}")
+        entry = ttk.Entry(name_row, textvariable=name_var, width=16)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        entry_dict = {"weights": weights, "name_var": name_var, "frame": row}
+        self._pending_selections.append(entry_dict)
+
+        def save(e=entry_dict):
+            name = e["name_var"].get().strip()
+            if not name:
+                return
+            self.library.add(name, e["weights"])
+            self._log(f"Saved '{name}' to library ({len(e['weights'])} assets)")
+            self._remove_pending_selection(e)
+
+        def discard(e=entry_dict):
+            self._remove_pending_selection(e)
+
+        StyledButton(name_row, text="Save", command=save).pack(side="left", padx=(0, 2))
+        StyledButton(name_row, text="Discard", command=discard).pack(side="left")
+        entry.bind("<Return>", lambda _e, s=save: s())
+
+        self.pending_hint.pack_forget()
+
+    def _remove_pending_selection(self, entry: dict) -> None:
+        if entry in self._pending_selections:
+            self._pending_selections.remove(entry)
+        entry["frame"].destroy()
+        if not self._pending_selections:
+            self.pending_hint.pack(anchor="w", fill="x")
 
     def _build_ui(self):
         left = tk.Frame(self, bg=BG, width=340)
@@ -875,13 +642,11 @@ class SpaceExplorerSection(tk.Frame):
         # Search mode
         mode_frame = self._make_section(inner, "Search Mode")
         self.search_mode = tk.StringVar(value="random")
-        tk.Radiobutton(
+        ttk.Radiobutton(
             mode_frame, text="Random Search", variable=self.search_mode, value="random",
-            bg=BG, fg=TEXT, font=FONT_SMALL, activebackground=BG, selectcolor=BG,
         ).pack(anchor="w")
-        tk.Radiobutton(
+        ttk.Radiobutton(
             mode_frame, text="Grid Search", variable=self.search_mode, value="grid",
-            bg=BG, fg=TEXT, font=FONT_SMALL, activebackground=BG, selectcolor=BG,
         ).pack(anchor="w")
 
         # Bootstrap params — defaults from engine config
@@ -893,6 +658,11 @@ class SpaceExplorerSection(tk.Frame):
         self.block_var = self._add_param(params_frame, "Block Size",
                                          str(cfg.BLOCK_SIZE))
         self.seed_var = self._add_param(params_frame, "Random Seed", "")
+        self.independent_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            params_frame, text="Independent Resampling (break correlations)",
+            variable=self.independent_var,
+        ).pack(anchor="w")
 
         # Multi-bootstrap params
         multi_frame = self._make_section(inner, "Search Parameters")
@@ -926,13 +696,8 @@ class SpaceExplorerSection(tk.Frame):
         delta_row.pack(fill="x", pady=(0, 4))
         FieldLabel(delta_row, text="Delta (abs)", bg=BG).pack(side="left", padx=(0, 4))
         self.space_delta_var = tk.StringVar(value="0.02")
-        tk.Entry(
-            delta_row,
-            textvariable=self.space_delta_var,
-            width=6,
-            font=(FONT_MONO[0], 9),
-            bd=1,
-            relief="solid",
+        NumericEntry(
+            delta_row, textvariable=self.space_delta_var, width=6, font=(theme.FONT_MONO[0], 9),
         ).pack(side="left", padx=(0, 4))
         StyledButton(
             delta_row,
@@ -945,15 +710,15 @@ class SpaceExplorerSection(tk.Frame):
             t = a["ticker"]
             row = tk.Frame(space_frame, bg=BG)
             row.pack(fill="x", pady=1)
-            tk.Label(row, text=t, font=(FONT_FAMILY[0], 9, "bold"), fg=TEXT,
-                     bg=BG, width=6, anchor="w").pack(side="left")
+            ttk.Label(row, text=t, font=(theme.FONT_FAMILY[0], 9, "bold"),
+                      width=6, anchor="w").pack(side="left")
             lo_var = tk.StringVar(value="0.0")
             hi_var = tk.StringVar(value="0.3")
-            tk.Entry(row, textvariable=lo_var, width=5, font=(FONT_MONO[0], 9),
-                     bd=1, relief="solid").pack(side="left", padx=1)
-            tk.Label(row, text="–", bg=BG, fg=TEXT_SEC).pack(side="left")
-            tk.Entry(row, textvariable=hi_var, width=5, font=(FONT_MONO[0], 9),
-                     bd=1, relief="solid").pack(side="left", padx=1)
+            NumericEntry(row, textvariable=lo_var, width=5,
+                         font=(theme.FONT_MONO[0], 9)).pack(side="left", padx=1)
+            ttk.Label(row, text="–", style="Secondary.TLabel").pack(side="left")
+            NumericEntry(row, textvariable=hi_var, width=5,
+                         font=(theme.FONT_MONO[0], 9)).pack(side="left", padx=1)
             self.space_entries[t] = (lo_var, hi_var)
 
         self._refresh_space_library_selector()
@@ -974,11 +739,11 @@ class SpaceExplorerSection(tk.Frame):
         self.date_start_var = tk.StringVar(value="")
         self.date_end_var = tk.StringVar(value="")
         FieldLabel(date_frame, text="Start (YYYY-MM)", bg=BG).pack(anchor="w")
-        tk.Entry(date_frame, textvariable=self.date_start_var, font=(FONT_FAMILY[0], 10),
-                 bd=1, relief="solid", width=12).pack(anchor="w", pady=(0, 4))
+        ttk.Entry(date_frame, textvariable=self.date_start_var, font=(theme.FONT_FAMILY[0], 10),
+                  width=12).pack(anchor="w", pady=(0, 4))
         FieldLabel(date_frame, text="End (YYYY-MM)", bg=BG).pack(anchor="w")
-        tk.Entry(date_frame, textvariable=self.date_end_var, font=(FONT_FAMILY[0], 10),
-                 bd=1, relief="solid", width=12).pack(anchor="w")
+        ttk.Entry(date_frame, textvariable=self.date_end_var, font=(theme.FONT_FAMILY[0], 10),
+                  width=12).pack(anchor="w")
 
         # Overlay selection — checkboxes (compute on toggle)
         overlay_frame = self._make_section(inner, "Current Portfolios Overlay")
@@ -986,6 +751,22 @@ class SpaceExplorerSection(tk.Frame):
         self.overlay_container.pack(fill="x", pady=2)
         self._overlay_vars: dict[str, tk.BooleanVar] = {}
         self._refresh_overlay_panel()
+
+        # Pending chart selections — non-modal. Clicking a point on the chart
+        # (which lives in the browser) used to pop a simpledialog.askstring()
+        # modal on top of the Tk window; if the browser had focus that modal
+        # was easy to miss and it blocked the Tk mainloop until dismissed.
+        # Clicks now just queue up here for the user to name/save at their
+        # own pace, or discard.
+        pending_frame = self._make_section(inner, "Pending Chart Selections")
+        self.pending_hint = ttk.Label(
+            pending_frame, text="Click a point on the chart to add it here.",
+            style="Secondary.TLabel", wraplength=280,
+        )
+        self.pending_hint.pack(anchor="w", fill="x")
+        self.pending_container = tk.Frame(pending_frame, bg=BG)
+        self.pending_container.pack(fill="x", pady=2)
+        self._pending_selections: list[dict] = []
 
     def _build_chart_panel(self, parent):
         """Right panel: run control, chart axes, progress, log, and chart button."""
@@ -1009,8 +790,8 @@ class SpaceExplorerSection(tk.Frame):
             run_frame, variable=self.progress_var, maximum=100
         )
         self.progress_bar.pack(fill="x", pady=4)
-        self.progress_label = tk.Label(
-            run_frame, text="", font=(FONT_FAMILY[0], 10), fg=TEXT_SEC, bg=BG
+        self.progress_label = ttk.Label(
+            run_frame, text="", font=(theme.FONT_FAMILY[0], 10), style="Secondary.TLabel",
         )
         self.progress_label.pack(fill="x")
 
@@ -1058,16 +839,16 @@ class SpaceExplorerSection(tk.Frame):
         )
         self.refresh_btn.pack(side="left")
 
-        self.chart_status = tk.Label(
-            axis_frame, text="No results yet", font=(FONT_FAMILY[0], 9),
-            fg=TEXT_SEC, bg=BG, anchor="w"
+        self.chart_status = ttk.Label(
+            axis_frame, text="No results yet", font=(theme.FONT_FAMILY[0], 9),
+            style="Secondary.TLabel", anchor="w",
         )
         self.chart_status.pack(fill="x", pady=(4, 0))
 
         # ── Log panel (expanded) ─────────────────────────────────────────
         log_frame = self._make_section(parent, "Log")
         self.log_text = tk.Text(
-            log_frame, font=(FONT_MONO[0], 9), bg=PANEL_BG, fg=TEXT,
+            log_frame, font=(theme.FONT_MONO[0], 9), bg=PANEL_BG, fg=TEXT,
             height=30, bd=1, relief="solid", wrap="word", state="normal"
         )
         self.log_text.pack(fill="both", expand=True, pady=2)
@@ -1076,9 +857,8 @@ class SpaceExplorerSection(tk.Frame):
         frame = tk.Frame(parent, bg=BG)
         frame.pack(fill="x", padx=PAD, pady=(PAD, 0))
         if title:
-            tk.Label(
-                frame, text=_label_text(title), font=(FONT_FAMILY[0], 9, "bold"),
-                fg=TEXT, bg=BG, anchor="w"
+            ttk.Label(
+                frame, text=title.upper(), font=(theme.FONT_FAMILY[0], 9, "bold"), anchor="w",
             ).pack(fill="x", pady=(0, 2))
             tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=(0, 4))
         return frame
@@ -1086,23 +866,26 @@ class SpaceExplorerSection(tk.Frame):
     def _add_param(self, parent, label, default):
         FieldLabel(parent, text=label, bg=BG).pack(anchor="w")
         var = tk.StringVar(value=default)
-        tk.Entry(
-            parent, textvariable=var, font=(FONT_FAMILY[0], 10), width=14,
-            bd=1, relief="solid"
+        ttk.Entry(
+            parent, textvariable=var, font=(theme.FONT_FAMILY[0], 10), width=14,
         ).pack(anchor="w", pady=(0, 4))
         return var
 
     def _load_search_csv_defaults(self):
         try:
             space = load_search_space(cfg.SEARCH_CSV)
-            for item in space:
-                t = item["ticker"]
-                if t in self.space_entries:
-                    lo_var, hi_var = self.space_entries[t]
-                    lo_var.set(f"{item['lo']:.2f}")
-                    hi_var.set(f"{item['hi']:.2f}")
-        except Exception:
-            pass
+        except (OSError, KeyError, ValueError) as e:
+            _gui_log.warning(
+                "[SPACE] Could not load search space defaults from %s: %s — "
+                "bounds stay at their built-in defaults.", cfg.SEARCH_CSV, e,
+            )
+            return
+        for item in space:
+            t = item["ticker"]
+            if t in self.space_entries:
+                lo_var, hi_var = self.space_entries[t]
+                lo_var.set(f"{item['lo']:.2f}")
+                hi_var.set(f"{item['hi']:.2f}")
 
     def _refresh_space_library_selector(self):
         names = self.library.names()
@@ -1205,9 +988,8 @@ class SpaceExplorerSection(tk.Frame):
         ).pack(side="left", padx=(0, 4))
 
         val_var = tk.StringVar(value="0.0")
-        tk.Entry(
-            row2, textvariable=val_var, font=(FONT_MONO[0], 9), width=10,
-            bd=1, relief="solid"
+        ttk.Entry(
+            row2, textvariable=val_var, font=(theme.FONT_MONO[0], 9), width=10,
         ).pack(side="left", padx=(0, 4))
 
         entry = {"metric_var": metric_var, "op_var": op_var, "val_var": val_var, "frame": outer}
@@ -1217,10 +999,8 @@ class SpaceExplorerSection(tk.Frame):
             self.cutoff_rows.remove(e)
             e["frame"].destroy()
 
-        remove_btn = tk.Button(
-            row2, text="REMOVE", font=(FONT_FAMILY[0], 8),
-            command=remove, bg=WARNING, fg=PANEL_BG, bd=1, relief="solid",
-            padx=6, pady=1, cursor="hand2"
+        remove_btn = ttk.Button(
+            row2, text="REMOVE", command=remove, style="Danger.TButton", cursor="hand2",
         )
         remove_btn.pack(side="right")
 
@@ -1244,11 +1024,8 @@ class SpaceExplorerSection(tk.Frame):
         for name in self.library.names():
             var = tk.BooleanVar(value=name in self._overlay_cache)
             self._overlay_vars[name] = var
-            cb = tk.Checkbutton(
-                self.overlay_container, text=name,
-                variable=var, font=(FONT_FAMILY[0], 9),
-                bg=BG, fg=TEXT, activebackground=BG, selectcolor=BG,
-                anchor="w",
+            cb = ttk.Checkbutton(
+                self.overlay_container, text=name, variable=var,
                 command=lambda n=name: self._toggle_overlay(n),
             )
             cb.pack(fill="x", anchor="w")
@@ -1300,6 +1077,7 @@ class SpaceExplorerSection(tk.Frame):
                 "block_size": int(self.block_var.get()),
                 "date_start": self.date_start_var.get().strip() or None,
                 "date_end": self.date_end_var.get().strip() or None,
+                "independent": self.independent_var.get(),
             }
         except ValueError:
             self.run_error.show("Invalid simulation parameters for overlay.")
@@ -1319,6 +1097,7 @@ class SpaceExplorerSection(tk.Frame):
                 random_seed=None,
                 date_start=params["date_start"],
                 date_end=params["date_end"],
+                independent=params.get("independent", False),
             )
             self._overlay_cache[name] = {"metrics": metrics, "params": dict(params)}
             # Signal UI to redraw
@@ -1357,6 +1136,26 @@ class SpaceExplorerSection(tk.Frame):
         ts = time.strftime("%H:%M:%S")
         self.log_text.insert("end", f"[{ts}] {msg}\n")
         self.log_text.see("end")
+        # Also log to the bootstrap.gui logger for terminal visibility
+        _gui_log.info(msg)
+
+    def _drain_engine_logs(self):
+        """Drain engine log messages from the queue into the GUI log panel."""
+        try:
+            while True:
+                msg = _gui_log_queue.get_nowait()
+                ts = time.strftime("%H:%M:%S")
+                self.log_text.insert("end", f"[{ts}] {msg}\n")
+                self.log_text.see("end")
+        except queue.Empty:
+            pass
+
+    def _poll_engine_logs(self):
+        """Periodic poll to drain engine log queue into GUI log."""
+        if self._destroyed:
+            return
+        self._drain_engine_logs()
+        self.after(150, self._poll_engine_logs)
 
     # ── Run control ───────────────────────────────────────────────────────
 
@@ -1408,13 +1207,32 @@ class SpaceExplorerSection(tk.Frame):
         n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
 
         # Log run parameters
-        self._log(f"--- Starting {method} search ---")
-        self._log(f"  N_portfolios={n_port}, N_sim={n_sim}")
-        self._log(f"  horizon={horizon}y, block={block}, flush={flush_n}")
+        self._log(f"══════════════════════════════════════════════════")
+        self._log(f"Starting {method.upper()} search")
+        self._log(f"══════════════════════════════════════════════════")
+        self._log(f"  N_portfolios={n_port}, N_simulations_per_portfolio={n_sim}")
+        self._log(f"  Horizon={horizon} years ({horizon * 12} months)")
+        self._log(f"  Block size={block} months (block bootstrap)")
+        self._log(f"  Flush interval={flush_n} portfolios")
+        self._log(f"  Random seed={seed or 'None (non-deterministic)'}")
         if date_start or date_end:
-            self._log(f"  date_range={date_start or '?'} → {date_end or '?'}")
-        self._log(f"  assets: {', '.join(s['ticker'] for s in space)}")
-        self._log(f"  workers: {n_workers} cores")
+            self._log(f"  Date filter: [{date_start or 'earliest'} → {date_end or 'latest'}]")
+        else:
+            self._log(f"  Date filter: None (using full history)")
+        self._log(f"  Search space ({len(space)} assets):")
+        lo_sum = sum(s['lo'] for s in space)
+        hi_sum = sum(s['hi'] for s in space)
+        for s in space:
+            self._log(f"    {s['ticker']:>6s}:  [{s['lo']:.4f}, {s['hi']:.4f}]")
+        self._log(f"  Sum of bounds:  lo_sum={lo_sum:.4f}  hi_sum={hi_sum:.4f}")
+        if lo_sum > 1.0 + 1e-9:
+            self._log(f"  ⚠️ WARNING: sum(lo)={lo_sum:.4f} > 1.0 → infeasible!")
+        if hi_sum < 1.0 - 1e-9:
+            self._log(f"  ⚠️ WARNING: sum(hi)={hi_sum:.4f} < 1.0 → infeasible!")
+        self._log(f"  Workers: {n_workers} CPU cores")
+        self._log(f"  Estimated work: {n_port} portfolios × {n_sim} sims = {n_port * n_sim:,} total simulations")
+        self._log(f"──────────────────────────────────────────────────")
+        self._log(f"Spawning background worker thread...")
 
         self.running = True
         self._stop_event.clear()
@@ -1428,7 +1246,8 @@ class SpaceExplorerSection(tk.Frame):
         thread = threading.Thread(
             target=self._search_worker,
             args=(space, method, n_port, grid_step, n_sim, horizon, block,
-                  seed, date_start, date_end, flush_n, n_jobs),
+                  seed, date_start, date_end, flush_n, n_jobs,
+                  self.independent_var.get()),
             daemon=True,
         )
         thread.start()
@@ -1436,19 +1255,28 @@ class SpaceExplorerSection(tk.Frame):
 
     def _search_worker(self, space, method, n_portfolios, grid_step,
                        n_sim, horizon, block, seed, date_start, date_end,
-                       flush_n, n_jobs):
+                       flush_n, n_jobs, independent=False):
         """Thin wrapper: delegates all heavy work to engine.run_multi_streaming."""
+        _gui_log.info("[GUI_WORKER] Worker thread started — entering run_multi_streaming()")
+        t_worker_start = time.perf_counter()
 
         def on_start(sorted_tickers, total):
+            _gui_log.info("[GUI_WORKER] on_start callback: %d tickers, %d portfolios",
+                          len(sorted_tickers), total)
             self.result_queue.put(("info", sorted_tickers, total))
 
         def on_batch(results, n_done, total, speed):
+            _gui_log.info("[GUI_WORKER] on_batch: %d/%d done (%.0f p/s), batch_size=%d",
+                          n_done, total, speed, len(results))
             self.result_queue.put(("batch", results, n_done, total, speed))
 
         def on_done(n_done, elapsed, avg_speed):
+            _gui_log.info("[GUI_WORKER] on_done: %d portfolios in %.1fs (%.0f p/s avg)",
+                          n_done, elapsed, avg_speed)
             self.result_queue.put(("done", n_done, elapsed, avg_speed))
 
         def on_error(msg):
+            _gui_log.error("[GUI_WORKER] on_error: %s", msg)
             self.result_queue.put(("error", msg))
 
         run_multi_streaming(
@@ -1465,6 +1293,7 @@ class SpaceExplorerSection(tk.Frame):
             seed=seed,
             flush_every=flush_n,
             return_weights=True,
+            independent=independent,
             on_start=on_start,
             on_batch=on_batch,
             on_done=on_done,
@@ -1503,20 +1332,25 @@ class SpaceExplorerSection(tk.Frame):
         except Exception:
             return
 
+        # Drain engine log messages first
+        self._drain_engine_logs()
+
         try:
             while True:
                 msg = self.result_queue.get_nowait()
                 if msg[0] == "error":
                     self.run_error.show(msg[1])
-                    self._log(f"ERROR: {msg[1]}")
+                    self._log(f"❌ ERROR: {msg[1]}")
                     self._finish_run()
                     return
                 elif msg[0] == "info":
                     self.sorted_tickers = msg[1]
                     total = msg[2]
                     self.progress_label.config(text=f"0 / {total} portfolios")
+                    self._log(f"Data loaded. Assets: {self.sorted_tickers}")
                     self._log(f"Evaluating {total} portfolios "
-                              f"({len(self.sorted_tickers)} assets)...")
+                              f"across {len(self.sorted_tickers)} assets...")
+                    self._log(f"Waiting for first batch from worker pool...")
                 elif msg[0] == "batch":
                     results, done_count, total, speed = (
                         msg[1], msg[2], msg[3], msg[4]
@@ -1524,18 +1358,28 @@ class SpaceExplorerSection(tk.Frame):
                     self.all_results.extend(results)
                     pct = (done_count / total) * 100
                     self.progress_var.set(pct)
+                    eta = (total - done_count) / max(speed, 0.1)
                     self.progress_label.config(
-                        text=f"{done_count} / {total} portfolios  ({speed:.0f} p/s)"
+                        text=f"{done_count} / {total} portfolios  "
+                             f"({speed:.0f} p/s, ETA ~{eta:.0f}s)"
                     )
+                    self._log(f"Batch: {done_count}/{total} ({pct:.1f}%) — "
+                              f"{speed:.0f} portfolios/s — "
+                              f"ETA ~{eta:.0f}s — "
+                              f"{len(self.all_results)} results accumulated")
                     self.chart_status.config(
                         text=f"{len(self.all_results)} results available"
                     )
                 elif msg[0] == "done":
                     n_done, elapsed, avg_speed = msg[1], msg[2], msg[3]
+                    self._log(f"══════════════════════════════════════════════════")
                     self._log(
-                        f"Done: {n_done} portfolios in {elapsed:.1f}s "
-                        f"({avg_speed:.0f} p/s avg)"
+                        f"✅ COMPLETE: {n_done} portfolios evaluated in {elapsed:.1f}s "
+                        f"({avg_speed:.0f} portfolios/s avg)"
                     )
+                    self._log(f"Total results in memory: {len(self.all_results)}")
+                    self._log(f"──────────────────────────────────────────────────")
+                    self._log(f"Generating Plotly interactive chart...")
                     # Drop stale overlay caches that were computed with different params.
                     current = self._current_overlay_params()
                     if current is not None:
@@ -1685,8 +1529,9 @@ class SpaceExplorerSection(tk.Frame):
                     hoverinfo="text",
                     name="Pareto Front (click to add to library)",
                 ))
-        except Exception:
-            pass
+        except (KeyError, ValueError) as e:
+            _gui_log.warning("[EXPLORER] Pareto frontier could not be computed: %s", e)
+            self.chart_status.config(text=f"Chart ready, but Pareto frontier failed: {e}")
 
         # Overlay cached portfolios (library items)
         current_overlay_params = self._current_overlay_params()
@@ -1827,17 +1672,15 @@ class SingleBootstrapSection(tk.Frame):
         tab_bar.pack(fill="x", padx=PAD, pady=(PAD, 0))
 
         self.mode_var = tk.StringVar(value="compare")
-        self.compare_btn = tk.Button(
-            tab_bar, text="MULTI-PORTFOLIO COMPARISON", font=(FONT_FAMILY[0], 9),
-            command=lambda: self._switch_mode("compare"),
-            bg=ACCENT, fg=PANEL_BG, bd=1, relief="solid", padx=10, pady=4,
+        self.compare_btn = StyledButton(
+            tab_bar, text="Multi-Portfolio Comparison",
+            command=lambda: self._switch_mode("compare"), style="Accent.TButton",
         )
         self.compare_btn.pack(side="left")
 
-        self.sweep_btn = tk.Button(
-            tab_bar, text="BLOCK-SIZE SENSITIVITY", font=(FONT_FAMILY[0], 9),
+        self.sweep_btn = StyledButton(
+            tab_bar, text="Block-Size Sensitivity",
             command=lambda: self._switch_mode("sweep"),
-            bg=PANEL_BG, fg=TEXT, bd=1, relief="solid", padx=10, pady=4,
         )
         self.sweep_btn.pack(side="left")
 
@@ -1853,13 +1696,13 @@ class SingleBootstrapSection(tk.Frame):
         if mode == "compare":
             self.sweep_frame.pack_forget()
             self.compare_frame.pack(fill="both", expand=True)
-            self.compare_btn.config(bg=ACCENT, fg=PANEL_BG)
-            self.sweep_btn.config(bg=PANEL_BG, fg=TEXT)
+            self.compare_btn.configure(style="Accent.TButton")
+            self.sweep_btn.configure(style="Ghost.TButton")
         else:
             self.compare_frame.pack_forget()
             self.sweep_frame.pack(fill="both", expand=True)
-            self.sweep_btn.config(bg=ACCENT, fg=PANEL_BG)
-            self.compare_btn.config(bg=PANEL_BG, fg=TEXT)
+            self.sweep_btn.configure(style="Accent.TButton")
+            self.compare_btn.configure(style="Ghost.TButton")
 
     def _refresh_portfolio_lists(self):
         self.compare_frame.refresh_list()
@@ -1900,14 +1743,14 @@ class CompareSubMode(tk.Frame):
             anchor="w", padx=PAD, pady=(PAD, 0)
         )
         self.portfolio_listbox = tk.Listbox(
-            config, font=(FONT_FAMILY[0], 10), bg=PANEL_BG, fg=TEXT,
+            config, font=(theme.FONT_FAMILY[0], 10), bg=PANEL_BG, fg=TEXT,
             selectmode="multiple", height=6, bd=0, highlightthickness=0
         )
         self.portfolio_listbox.pack(fill="both", expand=True, padx=PAD, pady=2)
         self.refresh_list()
 
-        self.warning_label = tk.Label(
-            config, text="", font=(FONT_FAMILY[0], 8), fg=WARNING, bg=PANEL_BG
+        self.warning_label = ttk.Label(
+            config, text="", font=(theme.FONT_FAMILY[0], 8), style="Error.Card.TLabel",
         )
         self.warning_label.pack(padx=PAD)
 
@@ -1927,11 +1770,16 @@ class CompareSubMode(tk.Frame):
         ]:
             FieldLabel(params, text=label, bg=PANEL_BG).pack(anchor="w")
             var = tk.StringVar(value=default)
-            tk.Entry(
-                params, textvariable=var, font=(FONT_FAMILY[0], 10), width=14,
-                bd=1, relief="solid"
+            ttk.Entry(
+                params, textvariable=var, font=(theme.FONT_FAMILY[0], 10), width=14,
             ).pack(anchor="w", pady=(0, 2))
             self._param_entries[key] = var
+
+        self.independent_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            params, text="Independent Resampling",
+            variable=self.independent_var, style="Card.TCheckbutton",
+        ).pack(anchor="w", padx=PAD)
 
         self.error_label = ErrorLabel(config, bg=PANEL_BG)
         self.error_label.pack(fill="x", padx=PAD)
@@ -1940,14 +1788,18 @@ class CompareSubMode(tk.Frame):
         ttk.Progressbar(config, variable=self.progress_var, maximum=100).pack(
             fill="x", padx=PAD, pady=2
         )
-        self.progress_label = tk.Label(
-            config, text="", font=(FONT_FAMILY[0], 8), fg=TEXT_SEC, bg=PANEL_BG
+        self.progress_label = ttk.Label(
+            config, text="", font=(theme.FONT_FAMILY[0], 8), style="Field.Card.TLabel",
         )
         self.progress_label.pack(padx=PAD)
 
-        StyledButton(config, text="Run Bootstrap", command=self._run).pack(
-            padx=PAD, pady=(2, PAD), anchor="w"
-        )
+        run_row = tk.Frame(config, bg=PANEL_BG)
+        run_row.pack(fill="x", padx=PAD, pady=(2, PAD))
+        self.run_btn = StyledButton(run_row, text="Run Bootstrap", command=self._run)
+        self.run_btn.pack(side="left", anchor="w")
+        self.stop_btn = StyledButton(run_row, text="Stop", command=self._stop)
+        self.stop_btn.pack(side="left", anchor="w", padx=(4, 0))
+        self.stop_btn.config(state="disabled")
 
         # Plot area
         self.plot_frame = tk.Frame(top, bg=BG)
@@ -1968,6 +1820,8 @@ class CompareSubMode(tk.Frame):
         return [names[i] for i in indices if i < len(names)]
 
     def _run(self):
+        if self.running:
+            return  # a click while already running must never start a second worker
         self.error_label.clear()
         selected = self._get_selected()
         if len(selected) < 1:
@@ -1994,46 +1848,112 @@ class CompareSubMode(tk.Frame):
         self.running = True
         self.results = {}
         self.progress_var.set(0)
+        self.run_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        independent = self.independent_var.get()
 
         thread = threading.Thread(
             target=self._worker,
             args=(selected, n_sim, horizon, block, seed,
-                  date_start, date_end, hist_start),
+                  date_start, date_end, hist_start, independent),
             daemon=True,
         )
         thread.start()
         self.after(200, self._poll)
 
+    def _stop(self):
+        self.running = False
+        self._log_stop_requested()
+
+    def _log_stop_requested(self):
+        _gui_log.info("[SINGLE] Stop requested by user")
+
     def _worker(self, names, n_sim, horizon, block, seed,
-                date_start, date_end, hist_start):
+                date_start, date_end, hist_start, independent):
         try:
             total = len(names)
+            _gui_log.info("[SINGLE] Starting single-bootstrap comparison for %d portfolios: %s",
+                          total, names)
+            _gui_log.info("[SINGLE] Params: n_sim=%d  horizon=%dy  block=%d  seed=%s",
+                          n_sim, horizon, block, seed)
+            _gui_log.info("[SINGLE] Date filter: [%s, %s]  hist_start=%s",
+                          date_start or "*", date_end or "*", hist_start or "None")
             for i, name in enumerate(names):
                 if not self.running:
+                    _gui_log.info("[SINGLE] Run cancelled by user")
                     break
+                _gui_log.info("[SINGLE] ── Portfolio %d/%d: '%s' ──", i + 1, total, name)
                 portfolio = _clean_portfolio(self.library.get(name))
                 if not portfolio:
+                    _gui_log.error("[SINGLE] Portfolio '%s' is empty or all-zero after cleaning!",
+                                   name)
                     self.result_queue.put(("error", f"Portfolio '{name}' is empty or all-zero."))
                     return
+                _gui_log.info("[SINGLE] Cleaned portfolio: %s", portfolio)
 
+                _gui_log.info("[SINGLE] Loading return data for '%s'...", name)
+                t0 = time.perf_counter()
                 rng = np.random.default_rng(seed)
-                weights_arr, ret_matrix = load_all_returns(
-                    portfolio, cfg.USE_AFTER_TER_RETURNS,
-                    date_start=date_start, date_end=date_end,
-                )
-                paths = simulate(weights_arr, ret_matrix, n_sim, horizon * 12, rng,
-                                 block_size=block)
+
+                if independent:
+                    weights_arr, returns_list = load_independent_returns(
+                        portfolio, cfg.USE_AFTER_TER_RETURNS,
+                        date_start=date_start, date_end=date_end,
+                    )
+                    _gui_log.info("[SINGLE] Independent data loaded in %.3fs: "
+                                  "per-asset lengths=%s  weights=%s",
+                                  time.perf_counter() - t0,
+                                  [len(r) for r in returns_list], weights_arr)
+
+                    _gui_log.info("[SINGLE] Running independent Monte-Carlo simulation: "
+                                  "%d sims × %d months (block=%d)...",
+                                  n_sim, horizon * 12, block)
+                    t1 = time.perf_counter()
+                    paths = simulate_independent(weights_arr, returns_list,
+                                                 n_sim, horizon * 12, rng,
+                                                 block_size=block)
+                    # Also load aligned matrix for historical overlay
+                    _, ret_matrix = load_all_returns(
+                        portfolio, cfg.USE_AFTER_TER_RETURNS,
+                        date_start=date_start, date_end=date_end,
+                    )
+                else:
+                    weights_arr, ret_matrix = load_all_returns(
+                        portfolio, cfg.USE_AFTER_TER_RETURNS,
+                        date_start=date_start, date_end=date_end,
+                    )
+                    _gui_log.info("[SINGLE] Data loaded in %.3fs: matrix=%s  weights=%s",
+                                  time.perf_counter() - t0, ret_matrix.shape, weights_arr)
+
+                    _gui_log.info("[SINGLE] Running Monte-Carlo simulation: "
+                                  "%d sims × %d months (block=%d)...",
+                                  n_sim, horizon * 12, block)
+                    t1 = time.perf_counter()
+                    paths = simulate(weights_arr, ret_matrix, n_sim, horizon * 12, rng,
+                                     block_size=block)
+                _gui_log.info("[SINGLE] Simulation done in %.3fs: paths=%s",
+                              time.perf_counter() - t1, paths.shape)
+
+                _gui_log.info("[SINGLE] Computing metrics...")
+                t2 = time.perf_counter()
                 metrics = compute_metrics(
-                    paths, horizon, horizon * 12, block_size=block, weights=weights_arr
+                    paths, horizon, horizon * 12, block_size=block, weights=weights_arr,
+                    tickers=sorted(portfolio.keys()),
                 )
+                _gui_log.info("[SINGLE] Metrics computed in %.3fs: %s",
+                              time.perf_counter() - t2,
+                              {k: f"{v:.4f}" if isinstance(v, float) else v
+                               for k, v in metrics.items()})
 
                 # Compute historical performance
+                _gui_log.info("[SINGLE] Computing historical performance...")
                 if hist_start:
                     # Use user-specified historical start for horizon years
                     try:
                         yr, mo = int(hist_start.split("-")[0]), int(hist_start.split("-")[1])
                         end_yr = yr + horizon
                         hist_end = f"{end_yr:04d}-{mo:02d}"
+                        _gui_log.info("[SINGLE] Historical window: %s → %s", hist_start, hist_end)
                         w_hist, ret_hist = load_all_returns(
                             portfolio, cfg.USE_AFTER_TER_RETURNS,
                             date_start=hist_start, date_end=hist_end,
@@ -2044,7 +1964,10 @@ class CompareSubMode(tk.Frame):
                         cum_hist = np.cumprod(1.0 + port_hist)
                         cum_hist = np.insert(cum_hist, 0, 1.0)
                         hist_label = f"Hist. ({hist_start} \u2192 {hist_end})"
-                    except Exception:
+                        _gui_log.info("[SINGLE] Historical path computed: %d months", len(cum_hist) - 1)
+                    except Exception as hist_exc:
+                        _gui_log.warning("[SINGLE] Hist window failed (%s), falling back to full data",
+                                         hist_exc)
                         # Fallback to full data
                         with np.errstate(all="ignore"):
                             port_monthly = ret_matrix @ weights_arr
@@ -2058,8 +1981,14 @@ class CompareSubMode(tk.Frame):
                     cum_hist = np.cumprod(1.0 + port_monthly)
                     cum_hist = np.insert(cum_hist, 0, 1.0)
                     hist_label = "Historical (full data)"
+                    _gui_log.info("[SINGLE] Using full historical data: %d months", len(cum_hist) - 1)
 
                 ann_ret = paths[:, -1] ** (1.0 / horizon) - 1.0
+                _gui_log.info("[SINGLE] Portfolio '%s' done: "
+                              "ann_ret median=%.4f  p5=%.4f  p95=%.4f",
+                              name, float(np.median(ann_ret)),
+                              float(np.percentile(ann_ret, 5)),
+                              float(np.percentile(ann_ret, 95)))
 
                 self.result_queue.put((
                     "result", name, {
@@ -2072,8 +2001,11 @@ class CompareSubMode(tk.Frame):
                     },
                     i + 1, total
                 ))
+            _gui_log.info("[SINGLE] All %d portfolios processed — sending 'done' signal",
+                          total)
             self.result_queue.put(("done",))
         except Exception as e:
+            _gui_log.error("[SINGLE] EXCEPTION in worker: %s", e, exc_info=True)
             self.result_queue.put(("error", str(e)))
 
     def _poll(self):
@@ -2091,6 +2023,8 @@ class CompareSubMode(tk.Frame):
                 if msg[0] == "error":
                     self.error_label.show(msg[1])
                     self.running = False
+                    self.run_btn.config(state="normal")
+                    self.stop_btn.config(state="disabled")
                     return
                 elif msg[0] == "result":
                     _, name, data, done, total = msg
@@ -2099,6 +2033,8 @@ class CompareSubMode(tk.Frame):
                     self.progress_label.config(text=f"{done}/{total} portfolios")
                 elif msg[0] == "done":
                     self.running = False
+                    self.run_btn.config(state="normal")
+                    self.stop_btn.config(state="disabled")
                     self._render_results()
                     return
         except queue.Empty:
@@ -2119,8 +2055,10 @@ class CompareSubMode(tk.Frame):
         horizon = int(self._param_entries["horizon"].get())
         colors = PORTFOLIO_COLORS[:len(names)]
 
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=PLOT_DPI)
-        fig.set_facecolor(BG)
+        # Explicit Figure (not plt.subplots): never registers with pyplot's
+        # global figure manager, so repeated Runs can't leak memory.
+        fig = Figure(figsize=(12, 8), dpi=theme.PLOT_DPI, facecolor=BG)
+        axes = fig.subplots(2, 2)
         fig.subplots_adjust(hspace=0.35, wspace=0.30, left=0.08, right=0.95,
                             top=0.93, bottom=0.08)
 
@@ -2264,24 +2202,24 @@ class CompareSubMode(tk.Frame):
         canvas.pack(side="left", fill="both", expand=True)
 
         # Header row
-        tk.Label(
-            table_inner, text="METRIC", font=(FONT_FAMILY[0], 9, "bold"),
-            bg=PANEL_BG, fg=TEXT, anchor="w", width=30
+        ttk.Label(
+            table_inner, text="METRIC", font=(theme.FONT_FAMILY[0], 9, "bold"),
+            style="Card.TLabel", anchor="w", width=30,
         ).grid(row=0, column=0, sticky="w", padx=4, pady=1)
         for ci, name in enumerate(names):
-            tk.Label(
-                table_inner, text=name, font=(FONT_FAMILY[0], 9, "bold"),
-                bg=PANEL_BG, fg=PORTFOLIO_COLORS[ci % len(PORTFOLIO_COLORS)],
-                anchor="e", width=16
+            ttk.Label(
+                table_inner, text=name, font=(theme.FONT_FAMILY[0], 9, "bold"),
+                style="Card.TLabel", foreground=PORTFOLIO_COLORS[ci % len(PORTFOLIO_COLORS)],
+                anchor="e", width=16,
             ).grid(row=0, column=ci + 1, sticky="e", padx=4, pady=1)
 
         sep = tk.Frame(table_inner, bg=BORDER, height=1)
         sep.grid(row=1, column=0, columnspan=len(names) + 1, sticky="ew", pady=2)
 
         for ri, key in enumerate(metric_keys):
-            tk.Label(
-                table_inner, text=key, font=(FONT_FAMILY[0], 9),
-                bg=PANEL_BG, fg=TEXT, anchor="w"
+            ttk.Label(
+                table_inner, text=key, font=(theme.FONT_FAMILY[0], 9),
+                style="Card.TLabel", anchor="w",
             ).grid(row=ri + 2, column=0, sticky="w", padx=4, pady=0)
 
             for ci, name in enumerate(names):
@@ -2290,16 +2228,16 @@ class CompareSubMode(tk.Frame):
                     txt = f"{v:.4f}"
                 else:
                     txt = str(v)
-                tk.Label(
-                    table_inner, text=txt, font=(FONT_MONO[0], 9),
-                    bg=PANEL_BG, fg=TEXT, anchor="e"
+                ttk.Label(
+                    table_inner, text=txt, font=(theme.FONT_MONO[0], 9),
+                    style="Card.TLabel", anchor="e",
                 ).grid(row=ri + 2, column=ci + 1, sticky="e", padx=4, pady=0)
 
             if ri % 2 == 0:
                 for col in range(len(names) + 1):
                     try:
                         w = table_inner.grid_slaves(row=ri + 2, column=col)[0]
-                        w.config(bg="#FAFAF5")
+                        w.config(background="#FAFAF5")
                     except Exception:
                         pass
 
@@ -2341,7 +2279,7 @@ class SweepSubMode(tk.Frame):
             anchor="w", padx=PAD, pady=(PAD, 0)
         )
         self.portfolio_listbox = tk.Listbox(
-            config, font=(FONT_FAMILY[0], 10), bg=PANEL_BG, fg=TEXT,
+            config, font=(theme.FONT_FAMILY[0], 10), bg=PANEL_BG, fg=TEXT,
             selectmode="browse", height=5, bd=0, highlightthickness=0
         )
         self.portfolio_listbox.pack(fill="x", padx=PAD, pady=2)
@@ -2359,9 +2297,8 @@ class SweepSubMode(tk.Frame):
         ]:
             FieldLabel(config, text=label, bg=PANEL_BG).pack(anchor="w", padx=PAD)
             var = tk.StringVar(value=default)
-            tk.Entry(
-                config, textvariable=var, font=(FONT_FAMILY[0], 10), width=14,
-                bd=1, relief="solid"
+            ttk.Entry(
+                config, textvariable=var, font=(theme.FONT_FAMILY[0], 10), width=14,
             ).pack(anchor="w", padx=PAD, pady=(0, 2))
             self._params[key] = var
 
@@ -2387,8 +2324,8 @@ class SweepSubMode(tk.Frame):
         ttk.Progressbar(config, variable=self.progress_var, maximum=100).pack(
             fill="x", padx=PAD, pady=2
         )
-        self.progress_label = tk.Label(
-            config, text="", font=(FONT_FAMILY[0], 8), fg=TEXT_SEC, bg=PANEL_BG
+        self.progress_label = ttk.Label(
+            config, text="", font=(theme.FONT_FAMILY[0], 8), style="Field.Card.TLabel",
         )
         self.progress_label.pack(padx=PAD)
 
@@ -2441,17 +2378,27 @@ class SweepSubMode(tk.Frame):
 
     def _worker(self, portfolio, bs_min, bs_max, n_sim, horizon, seed, date_start, date_end):
         try:
+            _gui_log.info("[SWEEP] Starting block-size sweep: bs=%d..%d  n_sim=%d  horizon=%dy",
+                          bs_min, bs_max, n_sim, horizon)
+            _gui_log.info("[SWEEP] Loading return data...")
+            t0 = time.perf_counter()
             weights_arr, ret_matrix = load_all_returns(
                 portfolio, cfg.USE_AFTER_TER_RETURNS,
                 date_start=date_start, date_end=date_end,
             )
+            _gui_log.info("[SWEEP] Data loaded in %.3fs: matrix=%s",
+                          time.perf_counter() - t0, ret_matrix.shape)
             block_sizes = list(range(bs_min, bs_max + 1))
             total = len(block_sizes)
             records = []
 
             for i, bs in enumerate(block_sizes):
                 if not self.running:
+                    _gui_log.info("[SWEEP] Cancelled by user at block_size=%d", bs)
                     break
+                _gui_log.info("[SWEEP] Block size %d/%d (bs=%d): simulating %d paths...",
+                              i + 1, total, bs, n_sim)
+                t1 = time.perf_counter()
                 rng = np.random.default_rng(seed)
                 m = run_bootstrap_preloaded(
                     weights_arr, ret_matrix,
@@ -2459,12 +2406,15 @@ class SweepSubMode(tk.Frame):
                 )
                 m["block_size"] = bs
                 records.append(m)
+                _gui_log.info("[SWEEP] Block size %d done in %.3fs", bs, time.perf_counter() - t1)
                 self.result_queue.put(("progress", i + 1, total))
 
             df = pd.DataFrame(records).set_index("block_size")
+            _gui_log.info("[SWEEP] Sweep complete: %d block sizes evaluated", len(records))
             self.result_queue.put(("done", df))
 
         except Exception as e:
+            _gui_log.error("[SWEEP] EXCEPTION: %s", e, exc_info=True)
             self.result_queue.put(("error", str(e)))
 
     def _poll(self):
@@ -2525,7 +2475,7 @@ class SweepSubMode(tk.Frame):
         y_vals = df_valid[y_key].values
         bs_vals = df_valid.index.values
 
-        fig = Figure(figsize=(9, 6), facecolor=BG, dpi=PLOT_DPI)
+        fig = Figure(figsize=(9, 6), facecolor=BG, dpi=theme.PLOT_DPI)
         ax = fig.add_subplot(111)
         apply_style(ax, f"Block-Size Sensitivity: {x_key} vs {y_key}")
 
@@ -2643,20 +2593,114 @@ class SweepSubMode(tk.Frame):
 # MAIN APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_UI_STATE_FILE = os.path.join(BASE_DIR, ".ui_state.json")
+
+_SECTIONS = [
+    ("builder", "1  PORTFOLIO BUILDER"),
+    ("explorer", "2  SPACE EXPLORER"),
+    ("single", "3  SINGLE BOOTSTRAP"),
+    ("lifecycle", "4  LIFE STRATEGY"),
+]
+
+
 class BootstrapApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
         self.title("Portfolio Bootstrap Analyser")
-        self.geometry("1400x900")
+        theme.init_theme(self)
         self.configure(bg=BG)
+        self.minsize(1100, 700)
+        self._restore_geometry()
 
-        self.library = PortfolioLibrary()
+        self.library = PortfolioLibrary(BASE_DIR, on_error=self._on_library_error)
 
-        self._active_btn = None
+        self._active_key: Optional[str] = None
+        self._section_factories = {
+            "builder": lambda parent: PortfolioBuilderSection(parent, self.library),
+            "explorer": lambda parent: SpaceExplorerSection(parent, self.library),
+            "single": lambda parent: SingleBootstrapSection(parent, self.library),
+            "lifecycle": self._make_lifecycle_section,
+        }
+        self.sections: dict[str, tk.Widget] = {}
+
         self._build_nav()
-        self._build_sections()
+        self.container = tk.Frame(self, bg=BG)
+        self.container.pack(fill="both", expand=True)
+
+        from bootstrap_gui.widgets import StatusBar
+        self.status_bar = StatusBar(self)
+        self.status_bar.pack(fill="x", side="bottom")
+        self.library.on_change(self._refresh_status_bar)
+        self._refresh_status_bar()
+
         self._show_section("builder")
+
+        for i, (key, _label) in enumerate(_SECTIONS, start=1):
+            self.bind(f"<Command-Key-{i}>", lambda e, k=key: self._show_section(k))
+            self.bind(f"<Control-Key-{i}>", lambda e, k=key: self._show_section(k))
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(300, self._poll_status_log)
+
+    def _make_lifecycle_section(self, parent):
+        from bootstrap_gui.sections.lifecycle import LifeStrategySection
+        return LifeStrategySection(parent, self.library)
+
+    def _on_library_error(self, msg: str) -> None:
+        _gui_log.error("[LIBRARY] %s", msg)
+        if hasattr(self, "status_bar"):
+            self.status_bar.set_message(msg)
+
+    def _restore_geometry(self) -> None:
+        geometry = "1400x900"
+        try:
+            if os.path.exists(_UI_STATE_FILE):
+                with open(_UI_STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                geometry = state.get("geometry", geometry)
+        except (OSError, json.JSONDecodeError) as e:
+            _gui_log.warning("[UI_STATE] Could not read %s: %s", _UI_STATE_FILE, e)
+        self.geometry(geometry)
+        self.update_idletasks()
+        # Centre on screen if this is a fresh install (no saved state).
+        if not os.path.exists(_UI_STATE_FILE):
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w, h = 1400, 900
+            self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    def _save_geometry(self) -> None:
+        try:
+            tmp_path = _UI_STATE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({"geometry": self.geometry()}, f)
+            os.replace(tmp_path, _UI_STATE_FILE)
+        except OSError as e:
+            _gui_log.warning("[UI_STATE] Could not save %s: %s", _UI_STATE_FILE, e)
+
+    def _on_close(self) -> None:
+        self._save_geometry()
+        self.destroy()
+
+    def _refresh_status_bar(self) -> None:
+        if hasattr(self, "status_bar"):
+            n = len(self.library.names())
+            self.status_bar.set_detail(f"{n} portfolio{'s' if n != 1 else ''} in library")
+
+    def _poll_status_log(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            while True:
+                msg = _gui_log_queue.get_nowait()
+                if hasattr(self, "status_bar"):
+                    self.status_bar.set_message(msg)
+        except queue.Empty:
+            pass
+        self.after(300, self._poll_status_log)
 
     def _build_nav(self):
         nav = tk.Frame(self, bg=BG)
@@ -2664,46 +2708,33 @@ class BootstrapApp(tk.Tk):
 
         tk.Frame(nav, bg=BORDER, height=1).pack(fill="x", side="bottom")
 
-        self.nav_buttons = {}
-        sections = [
-            ("builder", "1  PORTFOLIO BUILDER"),
-            ("explorer", "2  SPACE EXPLORER"),
-            ("single", "3  SINGLE BOOTSTRAP"),
-        ]
-
-        for key, label in sections:
-            btn = tk.Button(
-                nav, text=label, font=(FONT_FAMILY[0], 10),
-                bg=PANEL_BG, fg=TEXT, bd=1, relief="solid",
-                padx=16, pady=8, cursor="hand2",
-                command=lambda k=key: self._show_section(k),
-            )
+        self.nav_buttons: dict[str, StyledButton] = {}
+        for key, label in _SECTIONS:
+            btn = StyledButton(nav, text=label, command=lambda k=key: self._show_section(k))
             btn.pack(side="left")
-            btn.bind("<Enter>", lambda e, b=btn: b.config(bg=ACCENT, fg=PANEL_BG)
-                     if b != self._active_btn else None)
-            btn.bind("<Leave>", lambda e, b=btn: b.config(bg=PANEL_BG, fg=TEXT)
-                     if b != self._active_btn else None)
             self.nav_buttons[key] = btn
 
-    def _build_sections(self):
-        self.container = tk.Frame(self, bg=BG)
-        self.container.pack(fill="both", expand=True)
-        self.sections = {
-            "builder": PortfolioBuilderSection(self.container, self.library),
-            "explorer": SpaceExplorerSection(self.container, self.library),
-            "single": SingleBootstrapSection(self.container, self.library),
-        }
+    def _show_section(self, key: str) -> None:
+        if key not in self._section_factories:
+            return
+        if key not in self.sections:
+            try:
+                widget = self._section_factories[key](self.container)
+            except Exception as e:
+                _gui_log.error("[APP] Failed to build section '%s': %s", key, e, exc_info=True)
+                if hasattr(self, "status_bar"):
+                    self.status_bar.set_message(f"Could not open '{key}': {e}")
+                return
+            self.sections[key] = widget
 
-    def _show_section(self, key):
-        for s in self.sections.values():
-            s.pack_forget()
+        for k, widget in self.sections.items():
+            if k != key:
+                widget.pack_forget()
         self.sections[key].pack(fill="both", expand=True)
+
         for k, btn in self.nav_buttons.items():
-            if k == key:
-                btn.config(bg=ACCENT, fg=PANEL_BG)
-                self._active_btn = btn
-            else:
-                btn.config(bg=PANEL_BG, fg=TEXT)
+            btn.configure(style="Accent.TButton" if k == key else "Ghost.TButton")
+        self._active_key = key
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
