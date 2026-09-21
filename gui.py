@@ -44,7 +44,10 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.figure import Figure
+import plotly
 import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.offline import get_plotlyjs
 
 # ── project imports ───────────────────────────────────────────────────────────
 import sys
@@ -59,13 +62,16 @@ from engine.data import (
     parse_month_year,
     load_all_returns,
     load_independent_returns,
+    load_portfolios_on_common_window,
     load_portfolio_csv,
 )
-from engine.metrics import compute_metrics, shannon_entropy, type_entropy
+from engine.metrics import compute_metrics, effective_n_assets, effective_n_types
 from engine.pareto import compute_pareto
+from engine.plotprep import results_to_arrays, thin_scatter
 from engine.runner import (
     run_bootstrap,
     run_bootstrap_preloaded,
+    run_evolutionary_streaming,
     run_multi_streaming,
 )
 from engine.search import load_search_space
@@ -77,7 +83,9 @@ from bootstrap_gui.theme import (
     SCATTER_DOT, GRID_CLR, BORDER, HOVER_BG, PAD,
     apply_style, make_figure,
 )
-from bootstrap_gui.widgets import StyledButton, FieldLabel, NumericEntry, ErrorLabel
+from bootstrap_gui.widgets import (
+    StyledButton, FieldLabel, NumericEntry, ErrorLabel, ScrollableFrame,
+)
 from bootstrap_gui.library import PortfolioLibrary
 from bootstrap_gui.logsetup import gui_log_queue as _gui_log_queue, setup_logging
 from bootstrap_gui.assets import (
@@ -85,6 +93,8 @@ from bootstrap_gui.assets import (
     compute_date_intersection,
     clean_portfolio as _clean_portfolio,
     build_metric_list as _build_metric_list,
+    default_pareto_direction as _default_pareto_direction,
+    overlay_key as _overlay_key,
 )
 
 
@@ -183,16 +193,12 @@ class PortfolioBuilderSection(tk.Frame):
         )
         self.date_range_label.pack(fill="x", padx=PAD, pady=(2, 4))
 
-        canvas = tk.Canvas(frame, bg=PANEL_BG, highlightthickness=0, height=160)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        self.portfolio_inner = tk.Frame(canvas, bg=PANEL_BG)
-        self.portfolio_inner.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=self.portfolio_inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True, padx=PAD)
-        scrollbar.pack(side="right", fill="y", padx=(0, PAD))
+        scroll_holder = tk.Frame(frame, bg=PANEL_BG, height=160)
+        scroll_holder.pack(fill="x", expand=False, padx=PAD)
+        scroll_holder.pack_propagate(False)
+        scroll = ScrollableFrame(scroll_holder, bg=PANEL_BG)
+        scroll.pack(fill="both", expand=True)
+        self.portfolio_inner = scroll.inner
 
         self.portfolio_error = ErrorLabel(frame, bg=PANEL_BG)
         self.portfolio_error.pack(fill="x", padx=PAD, pady=(0, 2))
@@ -450,11 +456,29 @@ class SpaceExplorerSection(tk.Frame):
         self.sorted_tickers = []
         self.running = False
         self._stop_event = threading.Event()
-        self._overlay_cache: dict[str, dict] = {}  # name -> {metrics, params}
+        # Bumped on every new Run and on every Reset; every queued message
+        # from a search worker carries the run_id it was born under, so a
+        # message from a run that Reset already tore down (or a stale
+        # trailing message after Stop raced with a fresh Run) is recognised
+        # and dropped in _poll_results instead of corrupting current state.
+        self._run_id = 0
+        self._overlay_cache: dict[str, dict] = {}  # name -> {metrics, params, key, comparable}
         self._overlay_threads: dict[str, threading.Thread] = {}
         self._last_run_params: dict | None = None
+        self._last_run_meta: dict | None = None  # chart-metadata only, see _run_search
+        # Data the last run's cloud was actually evaluated against — an
+        # overlay portfolio must reuse this (same date window, same
+        # sim_seed) or its point isn't comparable to the cloud around it.
+        self._last_data: object | None = None          # ret_matrix or returns_list
+        self._last_sorted_tickers: list[str] = []
+        self._last_sim_seed: int | None = None
+        self._last_independent: bool = False
         self._chart_path: str | None = None
         self._chart_opened = False
+        self._chart_version = 0
+        self._chart_refresh_job: str | None = None
+        self._last_live_refresh = 0.0
+        self._invalidate_result_arrays()
         self._destroyed = False
         self._click_queue: queue.Queue = queue.Queue()
         self._click_port: int | None = None
@@ -487,10 +511,28 @@ class SpaceExplorerSection(tk.Frame):
         """
         results_dir = cfg.RESULTS_DIR
         click_queue = self._click_queue
+        section = self
 
         class Handler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=results_dir, **kwargs)
+
+            def do_GET(self):
+                # The open chart polls this and re-fetches figure.json only
+                # when the counter moved, so a regenerated chart lands in
+                # the already-open tab instead of waiting for a manual
+                # reload — and an idle tab costs one tiny response a second.
+                if self.path.split("?")[0] == "/version":
+                    body = json.dumps({"v": section._chart_version}).encode()
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                super().do_GET()
 
             def do_OPTIONS(self):
                 self.send_response(200)
@@ -523,7 +565,11 @@ class SpaceExplorerSection(tk.Frame):
                 pass  # suppress console noise
 
         try:
-            srv = socketserver.TCPServer(("localhost", 0), Handler)
+            # Threading: the chart polls /version once a second while a
+            # multi-MB figure.json download may be in flight — a
+            # single-threaded server would serialise the two.
+            srv = socketserver.ThreadingTCPServer(("localhost", 0), Handler)
+            srv.daemon_threads = True
             srv.allow_reuse_address = True
             self._click_port = srv.server_address[1]
             self._click_server = srv
@@ -630,23 +676,26 @@ class SpaceExplorerSection(tk.Frame):
         self._build_chart_panel(right)
 
     def _build_config_panel(self, parent):
-        canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=BG)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw", width=320)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        scroll = ScrollableFrame(parent, bg=BG, width=320)
+        scroll.pack(fill="both", expand=True)
+        inner = scroll.inner
 
         # Search mode
         mode_frame = self._make_section(inner, "Search Mode")
-        self.search_mode = tk.StringVar(value="random")
+        self.search_mode = tk.StringVar(value="mixed")
+        ttk.Radiobutton(
+            mode_frame, text="Mixed Search (recommended)", variable=self.search_mode,
+            value="mixed",
+        ).pack(anchor="w")
         ttk.Radiobutton(
             mode_frame, text="Random Search", variable=self.search_mode, value="random",
         ).pack(anchor="w")
         ttk.Radiobutton(
             mode_frame, text="Grid Search", variable=self.search_mode, value="grid",
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            mode_frame, text="Evolutionary Search", variable=self.search_mode,
+            value="evolutionary",
         ).pack(anchor="w")
 
         # Bootstrap params — defaults from engine config
@@ -670,8 +719,34 @@ class SpaceExplorerSection(tk.Frame):
                                                 str(cfg.N_PORTFOLIOS))
         self.grid_step_var = self._add_param(multi_frame, "Grid Step",
                                              str(cfg.GRID_STEP))
+        self.n_generations_var = self._add_param(
+            multi_frame, "Generations (evolutionary only)", "5")
         self.flush_interval_var = self._add_param(multi_frame, "Flush Every N", "500")
         self.n_jobs_var = self._add_param(multi_frame, "Parallel Jobs (-1=all)", "-1")
+
+        # Pareto objectives — which metrics define "the frontier", both for
+        # the diamond markers/line drawn on the chart and for what an
+        # evolutionary search refines around. Built dynamically (not a
+        # fixed list) so it always matches what compute_metrics can
+        # actually produce for the current BAD_PERCENTILE/VOLATILITY_WINDOWS
+        # config, same principle as the X/Y axis dropdowns.
+        pareto_frame = self._make_section(inner, "Pareto Objectives")
+        FieldLabel(
+            pareto_frame,
+            text="Which metrics define the frontier (chart + evolutionary search):",
+            bg=BG,
+        ).pack(anchor="w", pady=(0, 2))
+        self._pareto_metric_vars: dict[str, tk.BooleanVar] = {}
+        default_names = {m["name"] for m in cfg.PARETO_METRICS}
+        for metric_name in _build_metric_list():
+            var = tk.BooleanVar(value=metric_name in default_names)
+            var.trace_add("write", lambda *a: self._on_pareto_selection_changed())
+            self._pareto_metric_vars[metric_name] = var
+            direction = _default_pareto_direction(metric_name)
+            arrow = "↑ max" if direction == "maximize" else "↓ min"
+            ttk.Checkbutton(
+                pareto_frame, text=f"{metric_name}  ({arrow})", variable=var,
+            ).pack(anchor="w")
 
         # Search space
         space_frame = self._make_section(inner, "Search Space")
@@ -807,23 +882,46 @@ class SpaceExplorerSection(tk.Frame):
         x_col.pack(side="left", fill="x", expand=True, padx=(0, 4))
         FieldLabel(x_col, text="X Axis", bg=BG).pack(anchor="w")
         self.x_metric_var = tk.StringVar(value="annualised_return_p50")
-        ttk.Combobox(
+        self.x_metric_combo = ttk.Combobox(
             x_col, textvariable=self.x_metric_var, values=all_metrics,
             state="readonly", width=28
-        ).pack(fill="x", pady=(0, 4))
+        )
+        self.x_metric_combo.pack(fill="x", pady=(0, 4))
 
         y_col = tk.Frame(ax_row, bg=BG)
         y_col.pack(side="left", fill="x", expand=True)
         FieldLabel(y_col, text="Y Axis", bg=BG).pack(anchor="w")
         self.y_metric_var = tk.StringVar(value="annualised_return_p1")
-        ttk.Combobox(
+        self.y_metric_combo = ttk.Combobox(
             y_col, textvariable=self.y_metric_var, values=all_metrics,
             state="readonly", width=28
-        ).pack(fill="x", pady=(0, 4))
+        )
+        self.y_metric_combo.pack(fill="x", pady=(0, 4))
 
-        # Reactive: regenerate chart when axes change
-        self.x_metric_var.trace_add("write", lambda *_: self._regenerate_chart())
-        self.y_metric_var.trace_add("write", lambda *_: self._regenerate_chart())
+        # Reactive: regenerate chart when axes change (debounced — a
+        # regeneration touches every result, and the combobox can fire
+        # more than once per pick).
+        self.x_metric_var.trace_add("write", lambda *_: self._schedule_chart_refresh())
+        self.y_metric_var.trace_add("write", lambda *_: self._schedule_chart_refresh())
+
+        # ── Pareto-only toggle ───────────────────────────────────────────
+        self.pareto_only_var = tk.BooleanVar(value=False)
+        pareto_only_cb = ttk.Checkbutton(
+            axis_frame, text="Show Pareto frontier only (hide the cloud)",
+            variable=self.pareto_only_var,
+            command=lambda: self._schedule_chart_refresh(delay_ms=0),
+        )
+        pareto_only_cb.pack(fill="x", pady=(4, 0), anchor="w")
+
+        # ── Point budget ──────────────────────────────────────────────────
+        pts_row = tk.Frame(axis_frame, bg=BG)
+        pts_row.pack(fill="x", pady=(4, 0))
+        FieldLabel(pts_row, text="Max points drawn", bg=BG).pack(side="left")
+        self.max_points_var = tk.StringVar(value=str(self.MAX_CHART_POINTS))
+        ttk.Entry(
+            pts_row, textvariable=self.max_points_var,
+            font=(theme.FONT_MONO[0], 9), width=8,
+        ).pack(side="left", padx=(6, 0))
 
         # ── Chart button ──────────────────────────────────────────────────
         chart_btn_frame = tk.Frame(axis_frame, bg=BG)
@@ -1039,11 +1137,12 @@ class SpaceExplorerSection(tk.Frame):
             params = self._current_overlay_params()
             if params is None:
                 return
+            portfolio = _clean_portfolio(self.library.get(name) or {})
 
             cached = self._overlay_cache.get(name)
-            if cached and cached.get("params") == params:
+            if cached and cached.get("key") == self._current_overlay_key(params, portfolio):
                 if self.all_results:
-                    self._regenerate_chart()
+                    self._schedule_chart_refresh()
                 return
 
             existing = self._overlay_threads.get(name)
@@ -1064,7 +1163,32 @@ class SpaceExplorerSection(tk.Frame):
             self._overlay_threads.pop(name, None)
             # Regenerate chart to remove overlay
             if self.all_results:
-                self._regenerate_chart()
+                self._schedule_chart_refresh()
+
+    def _refresh_metric_dropdowns(self) -> None:
+        """Repopulate the X/Y axis dropdowns from the metrics ACTUALLY
+        present in this run's results, instead of the static engine-config
+        list. A metric can be legitimately absent for every result (e.g.
+        ``volatility_10y`` when the run's horizon is under 10 years, or any
+        volatility window when ``block_size`` doesn't divide the horizon
+        evenly) — offering it in the dropdown anyway used to mean every
+        point silently scored 0.0 on that axis instead of the chart saying
+        so.
+        """
+        if not self.all_results:
+            return
+        present: set[str] = set()
+        for r in self.all_results:
+            present.update(k for k in r.keys() if not k.startswith("_"))
+        available = sorted(present)
+        if not available:
+            return
+        self.x_metric_combo["values"] = available
+        self.y_metric_combo["values"] = available
+        if self.x_metric_var.get() not in available:
+            self.x_metric_var.set(available[0])
+        if self.y_metric_var.get() not in available:
+            self.y_metric_var.set(available[min(1, len(available) - 1)])
 
     def _current_overlay_params(self) -> dict | None:
         """Return the effective params overlays must use to match current results."""
@@ -1083,23 +1207,108 @@ class SpaceExplorerSection(tk.Frame):
             self.run_error.show("Invalid simulation parameters for overlay.")
             return None
 
+    def _overlay_use_preloaded(self, params: dict, portfolio: dict) -> bool:
+        """Would an overlay computed now reuse the run's exact data + seed?
+
+        Requires matching params AND that every ticker *portfolio* holds
+        is actually covered by the loaded run's search-space ticker set —
+        a portfolio using an asset outside the current search space can't
+        be sliced out of ``self._last_data`` at all (there's no column for
+        it), so it always falls back to a fresh computation instead. That
+        fallback used to be a hard error; it no longer needs to be, since
+        ``run_bootstrap`` now anchors to the full asset universe rather
+        than just the portfolio's own tickers (AUDIT.md M9) — it always
+        succeeds for any portfolio built from ``data/standard/`` assets,
+        it just isn't comparable to a cloud whose search space is a
+        strict subset of that universe (see ``comparable`` below).
+
+        Kept as its own method so ``_current_overlay_key`` can predict,
+        before computing anything, whether an overlay would land in the
+        comparable (preloaded) or non-comparable (fallback) branch.
+        """
+        return bool(
+            self._last_data is not None
+            and self._last_sorted_tickers
+            and self._last_run_params == params
+            and all(t in self._last_sorted_tickers for t in portfolio)
+        )
+
+    def _current_overlay_key(self, params: dict, portfolio: dict) -> tuple:
+        """Identity an overlay must match to be valid for the CURRENT cloud.
+
+        Simulation params alone are not enough to tell whether a cached
+        overlay is still comparable to what's on screen: the historical
+        date window and the Monte-Carlo draw both depend on the run's
+        full ticker set and ``sim_seed``, not just on n_sim/horizon/block
+        — and whether THIS portfolio's own tickers are even covered by
+        that ticker set is portfolio-specific, not a function of params
+        alone. An overlay computed via the fallback branch (no matching
+        run loaded, or this portfolio uses a ticker outside the run's
+        search space) is never comparable to a cloud, no matter what
+        params it used — so it always gets the ``(params, None, None)``
+        key here, which can only match another fallback overlay, never a
+        cloud.
+        """
+        if self._overlay_use_preloaded(params, portfolio):
+            return _overlay_key(params, self._last_sorted_tickers, self._last_sim_seed)
+        return _overlay_key(params, None, None)
+
     def _compute_overlay_worker(self, name: str, params: dict):
-        """Background thread: compute overlay metrics for one portfolio."""
+        """Background thread: compute overlay metrics for one portfolio.
+
+        Reuses the exact data + seed the run's cloud was evaluated against
+        (``self._last_data`` / ``self._last_sim_seed``, populated via
+        ``on_data_ready`` — see engine.runner.run_multi_streaming) whenever
+        *params* still matches that run AND every ticker the portfolio
+        holds is covered by the run's search space. Otherwise falls back
+        to ``run_bootstrap``, which anchors to the full asset universe
+        (AUDIT.md M9) — this always succeeds for any portfolio built from
+        ``data/standard/`` assets, even one using a ticker outside the
+        CURRENT search space; it just isn't comparable to a cloud whose
+        search space is a strict subset of that universe, which
+        ``comparable``/the caller's chart-drawing code marks accordingly
+        (open, dimmed marker + hover warning) instead of erroring out.
+        """
         try:
             portfolio = _clean_portfolio(self.library.get(name))
             if not portfolio:
                 return
-            metrics = run_bootstrap(
-                portfolio,
-                n_sim=params["n_sim"],
-                horizon_years=params["horizon_years"],
-                block_size=params["block_size"],
-                random_seed=None,
-                date_start=params["date_start"],
-                date_end=params["date_end"],
-                independent=params.get("independent", False),
-            )
-            self._overlay_cache[name] = {"metrics": metrics, "params": dict(params)}
+
+            use_preloaded = self._overlay_use_preloaded(params, portfolio)
+            if use_preloaded:
+                weights = np.array(
+                    [portfolio.get(t, 0.0) for t in self._last_sorted_tickers],
+                    dtype=np.float64,
+                )
+                rng = np.random.default_rng(self._last_sim_seed)
+                metrics = run_bootstrap_preloaded(
+                    weights,
+                    None if self._last_independent else self._last_data,
+                    n_sim=params["n_sim"],
+                    horizon_years=params["horizon_years"],
+                    block_size=params["block_size"],
+                    rng=rng,
+                    tickers=self._last_sorted_tickers,
+                    independent=self._last_independent,
+                    returns_list=self._last_data if self._last_independent else None,
+                )
+            else:
+                metrics = run_bootstrap(
+                    portfolio,
+                    n_sim=params["n_sim"],
+                    horizon_years=params["horizon_years"],
+                    block_size=params["block_size"],
+                    random_seed=None,
+                    date_start=params["date_start"],
+                    date_end=params["date_end"],
+                    independent=params.get("independent", False),
+                )
+            self._overlay_cache[name] = {
+                "metrics": metrics,
+                "params": dict(params),
+                "key": self._current_overlay_key(params, portfolio),
+                "comparable": use_preloaded,
+            }
             # Signal UI to redraw
             self.result_queue.put(("overlay_done", name))
         except Exception as e:
@@ -1114,8 +1323,9 @@ class SpaceExplorerSection(tk.Frame):
         for name, var in self._overlay_vars.items():
             if not var.get():
                 continue
+            portfolio = _clean_portfolio(self.library.get(name) or {})
             cached = self._overlay_cache.get(name)
-            if cached and cached.get("params") == params:
+            if cached and cached.get("key") == self._current_overlay_key(params, portfolio):
                 continue
             existing = self._overlay_threads.get(name)
             if existing and existing.is_alive():
@@ -1170,6 +1380,7 @@ class SpaceExplorerSection(tk.Frame):
             block = int(self.block_var.get())
             n_port = int(self.n_portfolios_var.get())
             grid_step = float(self.grid_step_var.get())
+            n_generations = int(self.n_generations_var.get())
             flush_n = int(self.flush_interval_var.get())
         except ValueError as e:
             self.run_error.show(f"Invalid parameter: {e}")
@@ -1186,6 +1397,7 @@ class SpaceExplorerSection(tk.Frame):
             "block_size": block,
             "date_start": date_start,
             "date_end": date_end,
+            "independent": self.independent_var.get(),
         }
 
         # Build search space from GUI entries
@@ -1206,11 +1418,34 @@ class SpaceExplorerSection(tk.Frame):
         n_jobs = int(n_jobs_str) if n_jobs_str else -1
         n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
 
+        # Chart-metadata only — kept separate from ``_last_run_params``
+        # (which feeds overlay-comparability equality checks) so a wider
+        # metadata set here can never change what counts as "the same
+        # run" for an overlay.
+        self._last_run_meta = {
+            "method": method,
+            "n_portfolios": n_port,
+            "seed": seed,
+            "space": [dict(s) for s in space],
+            "grid_step": grid_step if method == "grid" else None,
+            "n_generations": n_generations if method == "evolutionary" else None,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
         # Log run parameters
         self._log(f"══════════════════════════════════════════════════")
         self._log(f"Starting {method.upper()} search")
         self._log(f"══════════════════════════════════════════════════")
         self._log(f"  N_portfolios={n_port}, N_simulations_per_portfolio={n_sim}")
+        if n_sim < 5000:
+            self._log(
+                f"  ⚠️ n_sim={n_sim}: the CLOUD'S ABSOLUTE level has sampling "
+                f"noise of roughly ±0.7pp on annualised_return_p50 and ±2pp on "
+                f"annualised_return_p1 (measured at n_sim=1000; scales ~1/√n_sim). "
+                f"Comparisons BETWEEN portfolios in this run stay valid (they "
+                f"share sim_seed), but don't read the cloud's absolute position "
+                f"as precise at this n_sim."
+            )
         self._log(f"  Horizon={horizon} years ({horizon * 12} months)")
         self._log(f"  Block size={block} months (block bootstrap)")
         self._log(f"  Flush interval={flush_n} portfolios")
@@ -1236,91 +1471,170 @@ class SpaceExplorerSection(tk.Frame):
 
         self.running = True
         self._stop_event.clear()
+        self._run_id += 1
+        run_id = self._run_id
         self.all_results = []
+        self.sorted_tickers = []
+        self._invalidate_result_arrays()
+        self._last_live_refresh = 0.0
         self._chart_opened = False
 
         self.run_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.progress_var.set(0)
+        self.progress_label.config(text="")
+
+        # Replace whatever the chart was showing (a previous run's cloud,
+        # or nothing) right away — otherwise an already-open tab keeps
+        # displaying stale data with no indication a new run even
+        # started, which is indistinguishable from "the refresh is
+        # broken" from the user's side.
+        self._write_cleared_chart("Search running — no results yet.")
+        self.chart_status.config(text="Running — waiting for first batch...")
 
         thread = threading.Thread(
             target=self._search_worker,
-            args=(space, method, n_port, grid_step, n_sim, horizon, block,
-                  seed, date_start, date_end, flush_n, n_jobs,
-                  self.independent_var.get()),
+            args=(run_id, space, method, n_port, grid_step, n_generations, n_sim, horizon,
+                  block, seed, date_start, date_end, flush_n, n_jobs,
+                  self.independent_var.get(), self._current_pareto_metrics()),
             daemon=True,
         )
         thread.start()
         self.after(200, self._poll_results)
 
-    def _search_worker(self, space, method, n_portfolios, grid_step,
+    def _search_worker(self, run_id, space, method, n_portfolios, grid_step, n_generations,
                        n_sim, horizon, block, seed, date_start, date_end,
-                       flush_n, n_jobs, independent=False):
-        """Thin wrapper: delegates all heavy work to engine.run_multi_streaming."""
-        _gui_log.info("[GUI_WORKER] Worker thread started — entering run_multi_streaming()")
+                       flush_n, n_jobs, independent=False, pareto_metrics=None):
+        """Thin wrapper: delegates all heavy work to engine.run_multi_streaming
+        or, for the evolutionary method, engine.run_evolutionary_streaming."""
+        _gui_log.info("[GUI_WORKER] Worker thread started — entering run_%s_streaming()",
+                      "evolutionary" if method == "evolutionary" else "multi")
         t_worker_start = time.perf_counter()
 
         def on_start(sorted_tickers, total):
             _gui_log.info("[GUI_WORKER] on_start callback: %d tickers, %d portfolios",
                           len(sorted_tickers), total)
-            self.result_queue.put(("info", sorted_tickers, total))
+            self.result_queue.put(("info", run_id, sorted_tickers, total))
+
+        def on_data_ready(sorted_tickers, data, sim_seed):
+            _gui_log.info("[GUI_WORKER] on_data_ready: %d tickers, sim_seed=%s", len(sorted_tickers), sim_seed)
+            self.result_queue.put(("data_ready", run_id, sorted_tickers, data, sim_seed, independent))
+
+        def on_generation(gen, n_gens, frontier_size):
+            self._log(f"  Generation {gen + 1}/{n_gens}: refining around a "
+                      f"{frontier_size}-portfolio frontier...")
 
         def on_batch(results, n_done, total, speed):
             _gui_log.info("[GUI_WORKER] on_batch: %d/%d done (%.0f p/s), batch_size=%d",
                           n_done, total, speed, len(results))
-            self.result_queue.put(("batch", results, n_done, total, speed))
+            self.result_queue.put(("batch", run_id, results, n_done, total, speed))
 
         def on_done(n_done, elapsed, avg_speed):
             _gui_log.info("[GUI_WORKER] on_done: %d portfolios in %.1fs (%.0f p/s avg)",
                           n_done, elapsed, avg_speed)
-            self.result_queue.put(("done", n_done, elapsed, avg_speed))
+            self.result_queue.put(("done", run_id, n_done, elapsed, avg_speed))
 
         def on_error(msg):
             _gui_log.error("[GUI_WORKER] on_error: %s", msg)
-            self.result_queue.put(("error", msg))
+            self.result_queue.put(("error", run_id, msg))
 
-        run_multi_streaming(
-            space,
-            method=method,
-            n_portfolios=n_portfolios,
-            grid_step=grid_step,
-            n_sim=n_sim,
-            horizon_years=horizon,
-            block_size=block,
-            n_jobs=n_jobs,
-            date_start=date_start,
-            date_end=date_end,
-            seed=seed,
-            flush_every=flush_n,
-            return_weights=True,
-            independent=independent,
-            on_start=on_start,
-            on_batch=on_batch,
-            on_done=on_done,
-            on_error=on_error,
-            stop_event=self._stop_event,
-        )
+        if method == "evolutionary":
+            run_evolutionary_streaming(
+                space,
+                n_portfolios=n_portfolios,
+                n_generations=n_generations,
+                pareto_metrics=pareto_metrics,
+                n_sim=n_sim,
+                horizon_years=horizon,
+                block_size=block,
+                n_jobs=n_jobs,
+                date_start=date_start,
+                date_end=date_end,
+                seed=seed,
+                flush_every=flush_n,
+                return_weights=True,
+                independent=independent,
+                on_start=on_start,
+                on_data_ready=on_data_ready,
+                on_generation=on_generation,
+                on_batch=on_batch,
+                on_done=on_done,
+                on_error=on_error,
+                stop_event=self._stop_event,
+            )
+        else:
+            run_multi_streaming(
+                space,
+                method=method,
+                n_portfolios=n_portfolios,
+                grid_step=grid_step,
+                n_sim=n_sim,
+                horizon_years=horizon,
+                block_size=block,
+                n_jobs=n_jobs,
+                date_start=date_start,
+                date_end=date_end,
+                seed=seed,
+                flush_every=flush_n,
+                return_weights=True,
+                independent=independent,
+                on_start=on_start,
+                on_data_ready=on_data_ready,
+                on_batch=on_batch,
+                on_done=on_done,
+                on_error=on_error,
+                stop_event=self._stop_event,
+            )
 
     def _stop_search(self):
+        """Ask the worker to wind down — does NOT flip ``self.running``.
+
+        The worker thread always reports back through the queue (``on_done``
+        fires with whatever partial results it has even after a stop, see
+        ``run_multi_streaming``/``run_evolutionary_streaming``). Setting
+        ``running = False`` here used to kill ``_poll_results``'s own
+        reschedule loop immediately, before that final message arrived —
+        leaving it stuck in the queue forever, the Run button permanently
+        disabled, and the Stop button permanently (uselessly) enabled.
+        ``_finish_run`` is the only place ``running`` goes back to False now,
+        and it only runs once that final message is actually drained.
+        """
+        if not self.running:
+            return
         self._stop_event.set()
-        self.running = False
-        self._log("Stopping...")
+        self.stop_btn.config(state="disabled")
+        self._log("Stop requested — waiting for the worker pool to exit...")
 
     def _reset_search(self):
-        """Stop run and clear all results."""
+        """Stop any run in progress and clear all results — immediately.
+
+        Unlike Stop, this doesn't wait for the worker's final message: it
+        bumps ``_run_id`` so that message (if one is still in flight) is
+        recognised as stale and ignored by ``_poll_results`` instead of
+        reviving state this just cleared.
+        """
         self._stop_event.set()
+        self._run_id += 1
         self.running = False
         self.all_results = []
         self.sorted_tickers = []
+        self._invalidate_result_arrays()
         self.progress_var.set(0)
         self.progress_label.config(text="")
-        self.chart_status.config(text="No results yet")
         self.run_error.clear()
+        self._last_run_params = None
+        self._last_run_meta = None
 
         self.run_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self._chart_opened = False
         self._chart_path = None
+        # The chart tab, if open, otherwise keeps showing whatever cloud
+        # was on screen before Reset with nothing telling you it's stale —
+        # push an explicit "cleared" state so it can't be mistaken for
+        # live data.
+        self._write_cleared_chart("Reset — no results. Press Run to start a new search.")
+        self.chart_status.config(text="No results yet")
         self._log("Reset complete.")
 
     def _poll_results(self):
@@ -1338,23 +1652,56 @@ class SpaceExplorerSection(tk.Frame):
         try:
             while True:
                 msg = self.result_queue.get_nowait()
-                if msg[0] == "error":
-                    self.run_error.show(msg[1])
-                    self._log(f"❌ ERROR: {msg[1]}")
+                kind = msg[0]
+
+                # Every message from a search worker (all but the overlay
+                # ones, which aren't tied to a run) carries the run_id it
+                # was spawned under as its second element. Reset() bumps
+                # ``self._run_id`` precisely so a message from a run that
+                # was already torn down gets ignored here instead of
+                # reviving state Reset just cleared.
+                if kind in ("error", "info", "data_ready", "batch", "done"):
+                    run_id = msg[1]
+                    msg = msg[2:]
+                    if run_id != self._run_id:
+                        _gui_log.info(
+                            "[EXPLORER] Ignoring stale '%s' message from run %d "
+                            "(current run is %d)", kind, run_id, self._run_id,
+                        )
+                        continue
+
+                if kind == "error":
+                    self.run_error.show(msg[0])
+                    self._log(f"❌ ERROR: {msg[0]}")
                     self._finish_run()
                     return
-                elif msg[0] == "info":
-                    self.sorted_tickers = msg[1]
-                    total = msg[2]
+                elif kind == "info":
+                    self.sorted_tickers = msg[0]
+                    total = msg[1]
                     self.progress_label.config(text=f"0 / {total} portfolios")
                     self._log(f"Data loaded. Assets: {self.sorted_tickers}")
                     self._log(f"Evaluating {total} portfolios "
                               f"across {len(self.sorted_tickers)} assets...")
                     self._log(f"Waiting for first batch from worker pool...")
-                elif msg[0] == "batch":
-                    results, done_count, total, speed = (
-                        msg[1], msg[2], msg[3], msg[4]
-                    )
+                elif kind == "data_ready":
+                    # The exact data + seed this run's cloud is being evaluated
+                    # against — overlays reuse this so they land on the same
+                    # date window and Monte-Carlo draw as the cloud around them.
+                    self._last_sorted_tickers = msg[0]
+                    self._last_data = msg[1]
+                    self._last_sim_seed = msg[2]
+                    self._last_independent = msg[3]
+                    # sim_seed is shared by every candidate in the run (common
+                    # random numbers — cancels relative MC noise between
+                    # portfolios) but it also shifts the WHOLE cloud by one
+                    # shared historical draw. Surfacing it here is what lets
+                    # you tell "this cloud looks off" apart from "I compared
+                    # two clouds drawn with different seeds".
+                    self._log(f"  sim_seed={self._last_sim_seed} "
+                              f"(shared by every candidate — comparisons across "
+                              f"runs with a different sim_seed are not meaningful)")
+                elif kind == "batch":
+                    results, done_count, total, speed = msg[0], msg[1], msg[2], msg[3]
                     self.all_results.extend(results)
                     pct = (done_count / total) * 100
                     self.progress_var.set(pct)
@@ -1370,22 +1717,35 @@ class SpaceExplorerSection(tk.Frame):
                     self.chart_status.config(
                         text=f"{len(self.all_results)} results available"
                     )
-                elif msg[0] == "done":
-                    n_done, elapsed, avg_speed = msg[1], msg[2], msg[3]
+                    self._live_refresh_chart()
+                elif kind == "done":
+                    n_done, elapsed, avg_speed = msg[0], msg[1], msg[2]
+                    stopped_early = self._stop_event.is_set()
                     self._log(f"══════════════════════════════════════════════════")
                     self._log(
-                        f"✅ COMPLETE: {n_done} portfolios evaluated in {elapsed:.1f}s "
-                        f"({avg_speed:.0f} portfolios/s avg)"
+                        (f"⏹ STOPPED: {n_done} portfolios evaluated before the "
+                         f"stop request ({elapsed:.1f}s, {avg_speed:.0f} p/s avg)"
+                         if stopped_early else
+                         f"✅ COMPLETE: {n_done} portfolios evaluated in {elapsed:.1f}s "
+                         f"({avg_speed:.0f} portfolios/s avg)")
                     )
                     self._log(f"Total results in memory: {len(self.all_results)}")
                     self._log(f"──────────────────────────────────────────────────")
                     self._log(f"Generating Plotly interactive chart...")
-                    # Drop stale overlay caches that were computed with different params.
+                    self._refresh_metric_dropdowns()
+                    # Drop stale overlay caches — computed against different
+                    # params, a different ticker set, or a different sim_seed
+                    # than this run just produced. Keyed per-portfolio (not
+                    # one key for all): whether a portfolio's own tickers
+                    # are covered by this run's search space is portfolio-
+                    # specific, not just a function of the run's params.
                     current = self._current_overlay_params()
                     if current is not None:
                         self._overlay_cache = {
                             n: c for n, c in self._overlay_cache.items()
-                            if c.get("params") == current
+                            if c.get("key") == self._current_overlay_key(
+                                current, _clean_portfolio(self.library.get(n) or {})
+                            )
                         }
                     self.chart_status.config(
                         text=f"{len(self.all_results)} results — "
@@ -1400,12 +1760,21 @@ class SpaceExplorerSection(tk.Frame):
                         self._open_chart()
                     self._finish_run()
                     return
-                elif msg[0] == "overlay_done":
+                elif kind == "overlay_done":
                     name = msg[1]
                     self._log(f"Overlay '{name}' ready.")
                     if self.all_results:
-                        self._regenerate_chart()
-                elif msg[0] == "overlay_error":
+                        # Debounced: when several overlays finish in the
+                        # same poll (e.g. many library portfolios checked
+                        # at once after a run), each "overlay_done" used
+                        # to trigger its own synchronous chart rewrite —
+                        # queue.get_nowait() drains the WHOLE queue before
+                        # yielding back to Tk, so N overlays meant N
+                        # back-to-back full regenerations (each one a
+                        # multi-MB JSON write) freezing the UI in one go.
+                        # One coalesced redraw instead.
+                        self._schedule_chart_refresh()
+                elif kind == "overlay_error":
                     name, err = msg[1], msg[2]
                     self._log(f"Overlay '{name}' failed: {err}")
         except queue.Empty:
@@ -1419,161 +1788,418 @@ class SpaceExplorerSection(tk.Frame):
         self.stop_btn.config(state="disabled")
 
     # ── Plotly chart generation ───────────────────────────────────────────
+    #
+    # Everything below is built for the size this section actually reaches:
+    # a 100k-portfolio run. Three rules keep it interactive.
+    #
+    #   1. Nothing per-point is a Python string. The figure carries ONE
+    #      hover template plus a numeric ``customdata`` matrix, which
+    #      plotly serialises as base64 typed arrays. The old code
+    #      pre-rendered an HTML hover string and a {ticker: weight} dict
+    #      for every point — that is what turned a 100k run into a 137 MB
+    #      HTML file the browser had to parse before drawing anything.
+    #   2. The cloud is thinned to ``MAX_CHART_POINTS`` markers
+    #      (engine.plotprep.thin_scatter) before it leaves Python.
+    #   3. The page is written once as a small shell; refreshes rewrite
+    #      only ``figure.json`` and the already-open tab picks it up with
+    #      Plotly.react — no reload, no re-parse of plotly.js, and the
+    #      user's zoom survives (uirevision).
 
-    def _apply_cutoffs(self, results: list[dict]) -> list[dict]:
-        """Filter results by the current cutoff rules."""
-        cutoffs = self._get_cutoffs()
-        if not cutoffs:
-            return results
-        filtered = []
-        for r in results:
-            ok = True
-            for metric, op, val in cutoffs:
-                rv = r.get(metric)
-                if rv is None:
-                    ok = False
-                    break
-                if op == ">=" and rv < val:
-                    ok = False
-                elif op == "<=" and rv > val:
-                    ok = False
-                elif op == ">" and rv <= val:
-                    ok = False
-                elif op == "<" and rv >= val:
-                    ok = False
-                if not ok:
-                    break
-            if ok:
-                filtered.append(r)
-        return filtered
+    MAX_CHART_POINTS = 25_000
+    LIVE_REFRESH_SECONDS = 3.0
+
+    def _max_points(self) -> int:
+        """The user's point budget, clamped to something a browser survives."""
+        try:
+            return int(np.clip(int(float(self.max_points_var.get())), 500, 500_000))
+        except (ValueError, AttributeError):
+            return self.MAX_CHART_POINTS
+
+    def _live_refresh_chart(self) -> None:
+        """Push the partial cloud into the chart while the run is going.
+
+        The open tab polls for new figures on its own, so this is what
+        makes the space visibly fill in instead of showing nothing until
+        the run ends. Throttled, because a regeneration walks every
+        result accumulated so far.
+        """
+        if not self._click_port or not self.all_results:
+            return
+        now = time.monotonic()
+        if now - self._last_live_refresh < self.LIVE_REFRESH_SECONDS:
+            return
+        self._last_live_refresh = now
+        if self._regenerate_chart() and not self._chart_opened:
+            self._open_chart()
+
+    def _schedule_chart_refresh(self, delay_ms: int = 150) -> None:
+        """Coalesce bursts of refresh requests into one regeneration."""
+        if self._destroyed:
+            return
+        if self._chart_refresh_job is not None:
+            try:
+                self.after_cancel(self._chart_refresh_job)
+            except Exception:
+                pass
+        self._chart_refresh_job = self.after(delay_ms, self._run_scheduled_refresh)
+
+    def _run_scheduled_refresh(self) -> None:
+        self._chart_refresh_job = None
+        if not self._destroyed:
+            self._regenerate_chart()
+
+    def _invalidate_result_arrays(self) -> None:
+        self._metric_keys: list[str] = []
+        self._values: np.ndarray | None = None
+        self._weights: np.ndarray | None = None
+        self._arrays_n = -1
+        self._pareto_cache: tuple[bytes, np.ndarray] | None = None
+
+    def _ensure_result_arrays(self) -> bool:
+        """Vectorise ``all_results`` into numeric matrices (cached).
+
+        Rebuilt only when the result count changes — i.e. once per batch
+        during a run, and never again while the user flips axes or
+        cutoffs, which is where the interactive cost used to be.
+        """
+        n = len(self.all_results)
+        if n == 0:
+            self._invalidate_result_arrays()
+            return False
+        if n == self._arrays_n and self._values is not None:
+            return True
+        keys, values, weights = results_to_arrays(
+            self.all_results, len(self.sorted_tickers)
+        )
+        self._metric_keys = keys
+        self._values = values
+        self._weights = weights
+        self._arrays_n = n
+        self._pareto_cache = None
+        return True
+
+    def _apply_cutoffs(self, values: np.ndarray) -> np.ndarray:
+        """Boolean keep-mask over the rows of *values* for current cutoffs.
+
+        A cutoff on a metric no result carries drops everything — the
+        rule can't be satisfied, and silently ignoring it would show a
+        cloud that doesn't respect a filter the user set.
+        """
+        mask = np.ones(values.shape[0], dtype=bool)
+        for metric, op, val in self._get_cutoffs():
+            if metric not in self._metric_keys:
+                return np.zeros(values.shape[0], dtype=bool)
+            col = values[:, self._metric_keys.index(metric)]
+            with np.errstate(invalid="ignore"):
+                if op == ">=":
+                    ok = col >= val
+                elif op == "<=":
+                    ok = col <= val
+                elif op == ">":
+                    ok = col > val
+                elif op == "<":
+                    ok = col < val
+                else:
+                    continue
+            mask &= ok & np.isfinite(col)   # NaN never satisfies a cutoff
+        return mask
+
+    def _current_pareto_metrics(self) -> list[dict]:
+        """``[{"name": ..., "direction": ...}, ...]`` from the checked
+        Pareto Objectives boxes — falls back to ``cfg.PARETO_METRICS`` if
+        the panel hasn't been built yet (shouldn't happen once __init__
+        finishes, but keeps this method safe to call defensively)."""
+        metric_vars = getattr(self, "_pareto_metric_vars", None)
+        if not metric_vars:
+            return list(cfg.PARETO_METRICS)
+        return [
+            {"name": name, "direction": _default_pareto_direction(name)}
+            for name, var in metric_vars.items()
+            if var.get()
+        ]
+
+    def _on_pareto_selection_changed(self) -> None:
+        """A Pareto Objectives checkbox changed — the frontier for
+        whatever's currently on screen is now stale."""
+        self._pareto_cache = None
+        if self.all_results:
+            self._schedule_chart_refresh()
+
+    def _pareto_indices(self, keep: np.ndarray) -> np.ndarray:
+        """Frontier row-indices (into the full arrays) for the kept rows.
+
+        Cached against the keep-mask so switching axes — which doesn't
+        change the frontier, only how it is drawn — doesn't recompute it.
+        The cache is dropped by ``_on_pareto_selection_changed`` whenever
+        the objective checkboxes change, so a stale frontier from a
+        different metric selection can't survive a toggle.
+        """
+        signature = keep.tobytes()
+        if self._pareto_cache and self._pareto_cache[0] == signature:
+            return self._pareto_cache[1]
+
+        pareto_metrics = self._current_pareto_metrics()
+        names = [o["name"] for o in pareto_metrics]
+        dirs = [o["direction"] for o in pareto_metrics]
+        present = [(n, d) for n, d in zip(names, dirs) if n in self._metric_keys]
+        missing = [n for n in names if n not in self._metric_keys]
+        if missing:
+            _gui_log.warning(
+                "[EXPLORER] Pareto objective(s) %s absent from every result "
+                "(wrong horizon/block_size for this metric?) — excluded from "
+                "the frontier for this run.", missing,
+            )
+        if not present:
+            out = np.empty(0, dtype=np.intp)
+            self._pareto_cache = (signature, out)
+            return out
+
+        rows = np.flatnonzero(keep)
+        cols = [self._metric_keys.index(n) for n, _ in present]
+        data_p = self._values[np.ix_(rows, cols)]
+        # np.nan (not 0) for a missing objective: a fabricated "scored 0
+        # here" would drag a portfolio onto the frontier it never earned.
+        valid = np.all(np.isfinite(data_p), axis=1)
+        if valid.sum() > 1:
+            idx = compute_pareto(data_p[valid], [d for _, d in present])
+            out = rows[np.flatnonzero(valid)[idx]]
+        else:
+            out = np.empty(0, dtype=np.intp)
+        self._pareto_cache = (signature, out)
+        return out
+
+    def _hover_template(self) -> str:
+        """One template shared by every point in the cloud.
+
+        Column layout of ``customdata``: the weights (one per ticker, in
+        ``sorted_tickers`` order — the click handler reads these back to
+        rebuild the portfolio), then every metric in ``_metric_keys``.
+        """
+        lines = []
+        for i, ticker in enumerate(self.sorted_tickers):
+            lines.append(f"{ticker}: %{{customdata[{i}]:.1%}}")
+        if lines:
+            lines.append("────────")
+        off = len(self.sorted_tickers)
+        for j, key in enumerate(self._metric_keys):
+            lines.append(f"{key}: %{{customdata[{off + j}]:.4f}}")
+        return "<br>".join(lines) + "<extra></extra>"
+
+    def _customdata(self, rows: np.ndarray) -> np.ndarray:
+        """(len(rows), n_tickers + n_metrics) float32 matrix.
+
+        float32 halves the payload and is far more precision than a
+        hover label showing 4 decimals can use.
+        """
+        return np.hstack([self._weights[rows], self._values[rows]]).astype(np.float32)
+
+    def _run_metadata_text(self) -> str:
+        """What produced the cloud currently on screen — printed ON the
+        chart (see the annotation in ``_regenerate_chart``), not just in
+        the scrolling log, so a screenshot or a glance answers "what am I
+        even looking at": which search, over what history, over what
+        search space, with which seeds.
+        """
+        meta = self._last_run_meta
+        params = self._last_run_params
+        if not meta or not params:
+            return ""
+
+        date_start = params.get("date_start") or "earliest"
+        date_end = params.get("date_end") or "latest"
+        method = str(meta.get("method", "?")).upper()
+        lines = [
+            f"<b>{method} search</b> · {meta.get('n_portfolios', '?')} portfolios "
+            f"· started {meta.get('started_at', '?')}",
+            f"Dates: {date_start} → {date_end}",
+            f"n_sim={params['n_sim']} · horizon={params['horizon_years']}y · "
+            f"block={params['block_size']}mo"
+            + (" · independent" if params.get("independent") else ""),
+        ]
+        if meta.get("grid_step") is not None:
+            lines.append(f"Grid step: {meta['grid_step']}")
+        if meta.get("n_generations") is not None:
+            lines.append(f"Generations: {meta['n_generations']}")
+        seed_bits = [f"seed={meta.get('seed')}"]
+        if self._last_sim_seed is not None:
+            seed_bits.append(f"sim_seed={self._last_sim_seed}")
+        lines.append(" · ".join(seed_bits))
+
+        space = meta.get("space") or []
+        if space:
+            if len(space) <= 8:
+                space_txt = ", ".join(
+                    f"{s['ticker']} [{s['lo']:.0%}-{s['hi']:.0%}]" for s in space
+                )
+            else:
+                space_txt = f"{len(space)} assets — see log for bounds"
+            lines.append(f"Search space: {space_txt}")
+        return "<br>".join(lines)
 
     def _regenerate_chart(self, ignore_cutoffs: bool = False) -> bool:
         """Generate (or regenerate) the Plotly interactive scatter chart."""
-        if not self.all_results:
+        if not self._ensure_result_arrays():
             return False
 
         x_key = self.x_metric_var.get()
         y_key = self.y_metric_var.get()
+        if x_key not in self._metric_keys or y_key not in self._metric_keys:
+            self.chart_status.config(
+                text=f"'{x_key}' / '{y_key}' not present in any result "
+                     f"(wrong horizon/block_size for this metric?)"
+            )
+            return False
 
-        filtered = self.all_results if ignore_cutoffs else self._apply_cutoffs(self.all_results)
-        if not filtered:
+        n_total = self._values.shape[0]
+        keep = (np.ones(n_total, dtype=bool) if ignore_cutoffs
+                else self._apply_cutoffs(self._values))
+        n_cut = int(keep.sum())
+        if n_cut == 0:
             self.chart_status.config(text="All results filtered out")
             return False
 
-        xs = [r.get(x_key, 0) for r in filtered]
-        ys = [r.get(y_key, 0) for r in filtered]
+        # A metric can be legitimately absent from a result (e.g. a
+        # volatility window beyond the run's horizon) — plotting it as 0
+        # would show a point that scored 0 on an axis it was never
+        # actually evaluated on. Drop those points instead and say so.
+        xi = self._metric_keys.index(x_key)
+        yi = self._metric_keys.index(y_key)
+        keep &= np.isfinite(self._values[:, xi]) & np.isfinite(self._values[:, yi])
+        n_missing = n_cut - int(keep.sum())
+        if not keep.any():
+            self.chart_status.config(
+                text=f"'{x_key}' / '{y_key}' not present in any result "
+                     f"(wrong horizon/block_size for this metric?)"
+            )
+            return False
 
-        # ── Build customdata and hover text (notebook-style) ─────────────
-        customdata = []
-        hover_texts = []
-        for r in filtered:
-            lines = []
-            cd: dict = {}
-            if "_weights" in r and self.sorted_tickers:
-                for t, w in zip(self.sorted_tickers, r["_weights"]):
-                    lines.append(f"{t}: {w:.1%}")
-                    cd[t] = float(w)
-                lines.append("────────")
-            for k in sorted(r.keys()):
-                if k.startswith("_"):
-                    continue
-                v = r[k]
-                if isinstance(v, float):
-                    lines.append(f"{k}: {v:.4f}")
-                else:
-                    lines.append(f"{k}: {v}")
-            customdata.append(cd)
-            hover_texts.append("<br>".join(lines))
+        rows = np.flatnonzero(keep)
+        pareto_rows = self._pareto_indices(keep)
+        pareto_only = self.pareto_only_var.get()
 
+        # Thin the cloud, but never the frontier — it is the part the eye
+        # (and the click-to-library flow) is actually looking for, and it
+        # is small. Frontier points are drawn by their own trace, so they
+        # are excluded from the cloud rather than plotted twice.
+        if pareto_only:
+            cloud_rows = np.empty(0, dtype=np.intp)
+            n_cloud_full = 0
+        else:
+            cloud_rows = np.setdiff1d(rows, pareto_rows, assume_unique=True)
+            n_cloud_full = cloud_rows.size
+            thin = thin_scatter(
+                self._values[cloud_rows, xi], self._values[cloud_rows, yi],
+                self._max_points(),
+            )
+            cloud_rows = cloud_rows[thin]
+
+        template = self._hover_template()
         fig = go.Figure()
 
-        # Main scatter (use Scattergl for 10k+ points)
-        fig.add_trace(go.Scattergl(
-            x=xs, y=ys,
-            mode="markers",
-            marker=dict(
-                size=5,
-                color="rgba(74, 74, 74, 0.5)",
-                line=dict(width=0),
-            ),
-            customdata=customdata,
-            hovertext=hover_texts,
-            hoverinfo="text",
-            name="Portfolios (click to add to library)",
-        ))
+        if not pareto_only:
+            fig.add_trace(go.Scattergl(
+                x=self._values[cloud_rows, xi],
+                y=self._values[cloud_rows, yi],
+                mode="markers",
+                marker=dict(
+                    size=5,
+                    color="rgba(74, 74, 74, 0.5)",
+                    line=dict(width=0),
+                ),
+                customdata=self._customdata(cloud_rows),
+                hovertemplate=template,
+                name="Portfolios (click to add to library)",
+            ))
 
         # Pareto front
-        try:
-            pareto_names = [o["name"] for o in cfg.PARETO_METRICS]
-            pareto_dirs = [o["direction"] for o in cfg.PARETO_METRICS]
-            data_p = np.array(
-                [[r.get(n, 0) for n in pareto_names] for r in filtered]
-            )
-            valid = np.all(np.isfinite(data_p), axis=1)
-            if valid.sum() > 1:
-                pareto_idx = compute_pareto(data_p[valid], pareto_dirs)
-                valid_indices = np.where(valid)[0][pareto_idx]
-                pareto_x = [xs[i] for i in valid_indices]
-                pareto_y = [ys[i] for i in valid_indices]
-                pareto_cd = [customdata[i] for i in valid_indices]
-                pareto_hover = [hover_texts[i] for i in valid_indices]
-                sorted_quads = sorted(zip(pareto_x, pareto_y, pareto_cd, pareto_hover))
-                fig.add_trace(go.Scatter(
-                    x=[p[0] for p in sorted_quads],
-                    y=[p[1] for p in sorted_quads],
-                    mode="markers+lines",
-                    marker=dict(size=8, color="black", symbol="diamond"),
-                    line=dict(color="black", width=1.5),
-                    customdata=[p[2] for p in sorted_quads],
-                    hovertext=[p[3] for p in sorted_quads],
-                    hoverinfo="text",
-                    name="Pareto Front (click to add to library)",
-                ))
-        except (KeyError, ValueError) as e:
-            _gui_log.warning("[EXPLORER] Pareto frontier could not be computed: %s", e)
-            self.chart_status.config(text=f"Chart ready, but Pareto frontier failed: {e}")
+        if pareto_rows.size:
+            px = self._values[pareto_rows, xi]
+            py = self._values[pareto_rows, yi]
+            order = np.argsort(px, kind="stable")
+            pareto_rows = pareto_rows[order]
+            fig.add_trace(go.Scattergl(
+                x=px[order], y=py[order],
+                mode="markers+lines",
+                marker=dict(size=8, color="black", symbol="diamond"),
+                line=dict(color="black", width=1.5),
+                customdata=self._customdata(pareto_rows),
+                hovertemplate=template,
+                name="Pareto Front (click to add to library)",
+            ))
 
         # Overlay cached portfolios (library items)
         current_overlay_params = self._current_overlay_params()
         for name, cache_entry in self._overlay_cache.items():
-            if current_overlay_params is not None and cache_entry.get("params") != current_overlay_params:
-                continue
+            if current_overlay_params is not None:
+                portfolio_for_key = _clean_portfolio(self.library.get(name) or {})
+                expected_key = self._current_overlay_key(current_overlay_params, portfolio_for_key)
+                if cache_entry.get("key") != expected_key:
+                    continue
             metrics = cache_entry.get("metrics", {})
             cx = metrics.get(x_key)
             cy = metrics.get(y_key)
-            if cx is not None and cy is not None:
-                # Build full hover: composition + all metrics (same style as main scatter)
-                composition = self.library.get(name)
-                hover_lines = [f"<b>{name}</b>"]
-                cd: dict = {}
-                if composition:
-                    hover_lines.append("────────")
-                    for t, w in sorted(composition.items()):
-                        hover_lines.append(f"{t}: {w:.1%}")
-                        cd[t] = float(w)
+            if cx is None or cy is None:
+                continue
+            # An overlay computed via the fallback branch (no run loaded
+            # yet, or search-space ticker set / seed doesn't match) used a
+            # different historical window and Monte-Carlo draw than the
+            # cloud around it — its position isn't meaningful relative to
+            # the cloud, so it's drawn as an open, dimmed marker instead
+            # of a solid one, with a warning in the hover text.
+            comparable = cache_entry.get("comparable", True)
+            marker_color = "crimson" if comparable else "rgba(220, 20, 60, 0.45)"
+            marker_symbol = "star" if comparable else "star-open"
+            # A handful of points, so a hand-built hover string is free
+            # here — unlike the cloud, where it was the whole problem.
+            composition = self.library.get(name) or {}
+            hover_lines = [f"<b>{name}</b>"]
+            if not comparable:
+                hover_lines.append(
+                    "⚠ computed on a different data window / random draw "
+                    "than the cloud — not directly comparable"
+                )
+            if composition:
                 hover_lines.append("────────")
-                for k in sorted(metrics.keys()):
-                    if k.startswith("_"):
-                        continue
-                    v = metrics[k]
-                    if isinstance(v, float):
-                        hover_lines.append(f"{k}: {v:.4f}")
-                    else:
-                        hover_lines.append(f"{k}: {v}")
-                full_hover = "<br>".join(hover_lines)
-                fig.add_trace(go.Scatter(
-                    x=[cx], y=[cy],
-                    mode="markers+text",
-                    marker=dict(size=16, symbol="star", color="crimson"),
-                    text=[name],
-                    textposition="top right",
-                    textfont=dict(size=11, color="crimson"),
-                    name=name,
-                    customdata=[cd],
-                    hoverinfo="text",
-                    hovertext=full_hover,
-                ))
+                for t, w in sorted(composition.items()):
+                    hover_lines.append(f"{t}: {w:.1%}")
+            hover_lines.append("────────")
+            for k in sorted(metrics.keys()):
+                if k.startswith("_"):
+                    continue
+                v = metrics[k]
+                hover_lines.append(
+                    f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
+                )
+            # customdata keeps the cloud's layout (weights first, in
+            # sorted_tickers order) so the click handler needs no special
+            # case for overlay points.
+            cd = [float(composition.get(t, 0.0)) for t in self.sorted_tickers]
+            fig.add_trace(go.Scatter(
+                x=[cx], y=[cy],
+                mode="markers+text",
+                marker=dict(size=16, symbol=marker_symbol, color=marker_color),
+                text=[name],
+                textposition="top right",
+                textfont=dict(size=11, color="crimson"),
+                name=name,
+                customdata=[cd],
+                hoverinfo="text",
+                hovertext="<br>".join(hover_lines),
+            ))
 
+        n_drawn = cloud_rows.size + pareto_rows.size
+        status = f"{n_total} results"
+        if n_cut < n_total:
+            status += f" ({n_cut} after filters"
+            status += f", {n_missing} missing '{x_key}'/'{y_key}'" if n_missing else ""
+            status += ")"
+        if pareto_only:
+            status += f" — {pareto_rows.size} on the Pareto front"
+        elif cloud_rows.size < n_cloud_full:
+            status += f" — {n_drawn} plotted (thinned)"
+        bar_text = f"<b>{n_drawn:,}</b> points drawn — {status}"
+
+        meta_text = self._run_metadata_text()
         fig.update_layout(
             title=dict(
                 text=f"{y_key}  vs  {x_key}",
@@ -1583,8 +2209,7 @@ class SpaceExplorerSection(tk.Frame):
             yaxis_title=y_key,
             template="plotly_white",
             hovermode="closest",
-            width=1400,
-            height=850,
+            autosize=True,
             margin=dict(l=80, r=40, t=60, b=60),
             legend=dict(
                 yanchor="top", y=0.99,
@@ -1592,44 +2217,222 @@ class SpaceExplorerSection(tk.Frame):
                 bgcolor="rgba(255,255,255,0.8)",
             ),
             dragmode="zoom",   # box-zoom by default
+            # Keyed on the axes: a live refresh that only changed the data
+            # (new batch, new cutoff) keeps the user's zoom, while picking
+            # a different metric resets the view as it should.
+            uirevision=f"{x_key}|{y_key}",
+            # What is this cloud actually showing? Dates, search space,
+            # method, seeds — printed ON the chart itself (not just in the
+            # scrolling log) so a screenshot or a glance answers it.
+            annotations=(
+                [dict(
+                    xref="paper", yref="paper", x=0.01, y=0.99,
+                    xanchor="left", yanchor="top",
+                    text=meta_text,
+                    showarrow=False,
+                    align="left",
+                    font=dict(size=11, color="#333"),
+                    bgcolor="rgba(255,255,255,0.85)",
+                    bordercolor="#ccc", borderwidth=1, borderpad=6,
+                )] if meta_text else []
+            ),
+            # Consumed by the already-open tab's own status bar (see
+            # _chart_shell_html) instead of a value baked into that page
+            # at load time — the old code froze the point count at
+            # whatever it was when the tab was FIRST opened, so a live
+            # run's "N points drawn" never moved even though the chart
+            # itself kept redrawing correctly. Every field the bar needs
+            # now travels inside the same figure.json the page already
+            # re-fetches on every version bump.
+            meta=dict(bar_text=bar_text, meta_text=meta_text),
         )
 
-        chart_path = os.path.join(cfg.RESULTS_DIR, "scatter.html")
-        os.makedirs(os.path.dirname(chart_path), exist_ok=True)
-        fig.write_html(chart_path, auto_open=False, div_id="bootstrap-scatter")
-        # ── Inject click-to-library JS (same-origin POST, no CORS issues) ──
-        if self._click_port:
-            click_script = (
-                "<script>\n"
-                "(function() {\n"
-                "    var div = document.getElementById('bootstrap-scatter');\n"
-                "    if (!div || !div.on) return;\n"
-                "    div.on('plotly_click', function(data) {\n"
-                "        if (!data.points || data.points.length === 0) return;\n"
-                "        var pt = data.points[0];\n"
-                "        if (!pt.customdata || Object.keys(pt.customdata).length === 0) return;\n"
-                "        fetch('/click', {\n"
-                "            method: 'POST',\n"
-                "            headers: {'Content-Type': 'application/json'},\n"
-                "            body: JSON.stringify({portfolio: pt.customdata})\n"
-                "        }).catch(function(e) { console.warn('Click server error:', e); });\n"
-                "    });\n"
-                "})();\n"
-                "</script>"
-            )
-            with open(chart_path, "r", encoding="utf-8") as fh:
-                html = fh.read()
-            html = html.replace("</body>", click_script + "\n</body>")
-            with open(chart_path, "w", encoding="utf-8") as fh:
-                fh.write(html)
-        self._chart_path = chart_path
-        n_filtered = len(filtered)
-        n_total = len(self.all_results)
-        status = f"{n_total} results"
-        if n_filtered < n_total:
-            status += f" ({n_filtered} after filters)"
+        self._write_chart(fig)
         self.chart_status.config(text=status + " — chart ready")
         return True
+
+    # ── Chart files ───────────────────────────────────────────────────────
+
+    def _write_chart(self, fig: go.Figure) -> None:
+        """Write the chart to ``results/``.
+
+        With the click server up the page is a small shell that fetches
+        ``figure.json`` and re-``Plotly.react``s whenever the version
+        counter changes, so a refresh costs one JSON fetch in an already
+        open tab. Without it (server failed to bind) there is no origin to
+        fetch from, so fall back to a self-contained HTML file.
+        """
+        results_dir = cfg.RESULTS_DIR
+        os.makedirs(results_dir, exist_ok=True)
+        chart_path = os.path.join(results_dir, "scatter.html")
+
+        if not self._click_port:
+            fig.write_html(chart_path, auto_open=False, div_id="bootstrap-scatter")
+            self._chart_path = chart_path
+            return
+
+        self._write_plotly_js(results_dir)
+        json_path = os.path.join(results_dir, "figure.json")
+        tmp_path = json_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(pio.to_json(fig))
+        os.replace(tmp_path, json_path)   # never serve a half-written figure
+
+        self._chart_version += 1
+        with open(chart_path, "w", encoding="utf-8") as fh:
+            fh.write(self._chart_shell_html())
+        self._chart_path = chart_path
+
+    def _write_cleared_chart(self, message: str) -> None:
+        """Push an explicit placeholder chart — used the moment a new Run
+        starts and on Reset — so an already-open tab is never left
+        displaying a previous (or just-discarded) run's cloud with
+        nothing on screen to say it's stale. Still carries whatever run
+        metadata is current (there may be none, e.g. right after Reset).
+        """
+        meta_text = self._run_metadata_text()
+        lines = [message] + ([meta_text] if meta_text else [])
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            annotations=[dict(
+                xref="paper", yref="paper", x=0.5, y=0.5,
+                xanchor="center", yanchor="middle",
+                text="<br>".join(lines),
+                showarrow=False,
+                align="center",
+                font=dict(size=14, color="#666"),
+            )],
+            uirevision="cleared",
+            meta=dict(bar_text=message, meta_text=meta_text),
+        )
+        self._write_chart(fig)
+
+    @staticmethod
+    def _write_plotly_js(results_dir: str) -> None:
+        """Drop plotly.min.js next to the chart, once per plotly version.
+
+        Serving it as its own file (instead of inlining ~3.5 MB into every
+        rewrite of the page) means the browser parses it once and caches
+        it — and a live update doesn't re-parse it at all.
+        """
+        js_path = os.path.join(results_dir, "plotly.min.js")
+        stamp_path = os.path.join(results_dir, "plotly.version")
+        want = plotly.__version__
+        try:
+            with open(stamp_path, encoding="utf-8") as fh:
+                have = fh.read().strip()
+        except OSError:
+            have = None
+        if have == want and os.path.exists(js_path):
+            return
+        with open(js_path, "w", encoding="utf-8") as fh:
+            fh.write(get_plotlyjs())
+        with open(stamp_path, "w", encoding="utf-8") as fh:
+            fh.write(want)
+
+    def _chart_shell_html(self) -> str:
+        """The page written to ``scatter.html`` — a shell, not a snapshot.
+
+        This is written once per regeneration but the already-open tab
+        never re-fetches it: it only polls ``/version`` and re-fetches
+        ``figure.json``. So nothing that can change between regenerations
+        (point count, run metadata) may be baked in as a JS literal here —
+        it has to travel inside ``figure.json`` itself (``fig.layout.meta``)
+        and be read back out on every ``load()``, or the bar goes stale
+        the moment a second regeneration happens while the tab stays open.
+        """
+        tickers = json.dumps(self.sorted_tickers)
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Portfolio Space Explorer</title>
+<script src="plotly.min.js"></script>
+<style>
+  html, body {{ margin: 0; height: 100%; font-family: system-ui, sans-serif; }}
+  #bootstrap-scatter {{ width: 100vw; height: calc(100vh - 26px); }}
+  #bar {{ height: 26px; line-height: 26px; padding: 0 10px; font-size: 12px;
+         color: #555; background: #f4f4f4; border-top: 1px solid #ddd;
+         white-space: nowrap; overflow: hidden; }}
+  #bar b {{ color: #222; }}
+</style>
+</head>
+<body>
+<div id="bootstrap-scatter"></div>
+<div id="bar">loading…</div>
+<script>
+(function () {{
+  var TICKERS = {tickers};
+  var div = document.getElementById('bootstrap-scatter');
+  var bar = document.getElementById('bar');
+  var CONFIG = {{responsive: true, scrollZoom: true, displaylogo: false}};
+  var version = null;
+  var bound = false;
+  var busy = false;
+
+  function status(msg) {{ bar.innerHTML = msg; }}
+
+  function bind() {{
+    if (bound || !div.on) return;
+    bound = true;
+    div.on('plotly_click', function (data) {{
+      if (!data.points || !data.points.length) return;
+      var cd = data.points[0].customdata;
+      if (!cd || !cd.length) return;
+      var portfolio = {{}};
+      for (var i = 0; i < TICKERS.length && i < cd.length; i++) {{
+        portfolio[TICKERS[i]] = cd[i];
+      }}
+      fetch('/click', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{portfolio: portfolio}})
+      }}).catch(function (e) {{ console.warn('Click server error:', e); }});
+    }});
+  }}
+
+  function load(v) {{
+    busy = true;
+    status('updating…');
+    fetch('figure.json?v=' + v, {{cache: 'no-store'}}).then(function (r) {{ return r.json(); }})
+      .then(function (fig) {{
+        // react(), not newPlot(): same WebGL context, and the layout's
+        // uirevision keeps the current zoom unless the axes changed.
+        return Plotly.react(div, fig.data, fig.layout, CONFIG).then(function () {{ return fig; }});
+      }})
+      .then(function (fig) {{
+        bind();
+        version = v;
+        busy = false;
+        var meta = (fig.layout && fig.layout.meta) || {{}};
+        var barText = meta.bar_text || 'chart updated';
+        status(barText + ' · click a point to send it to the library · '
+               + 'updated ' + new Date().toLocaleTimeString());
+      }})
+      .catch(function (e) {{
+        busy = false;
+        status('update failed: ' + e);
+      }});
+  }}
+
+  function poll() {{
+    if (busy) return;
+    fetch('/version', {{cache: 'no-store'}})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (d) {{ if (d.v !== version) load(d.v); }})
+      .catch(function () {{}});
+  }}
+
+  poll();
+  setInterval(poll, 1500);
+}})();
+</script>
+</body>
+</html>
+"""
 
     def _open_chart(self):
         """Open the scatter chart via the local HTTP server.
@@ -1722,6 +2525,7 @@ class CompareSubMode(tk.Frame):
         self.result_queue = queue.Queue()
         self.running = False
         self.results = {}  # name -> {metrics, paths, ann_ret, weights_arr, historical, hist_label}
+        self._shared_window: tuple[int, list[str]] | None = None
         self._destroyed = False
 
         self._build_ui()
@@ -1731,7 +2535,16 @@ class CompareSubMode(tk.Frame):
         super().destroy()
 
     def _build_ui(self):
-        top = tk.Frame(self, bg=BG)
+        # The plot grid alone can be taller than the window (fixed geometry
+        # from ui_state.json), which would silently clip the summary table
+        # — including the drawdown rows — below the visible area. Wrapping
+        # everything in a ScrollableFrame guarantees the table stays
+        # reachable no matter how tall the plots render.
+        scroll = ScrollableFrame(self, bg=BG)
+        scroll.pack(fill="both", expand=True)
+        outer = scroll.inner
+
+        top = tk.Frame(outer, bg=BG)
         top.pack(fill="x", padx=PAD, pady=PAD)
 
         # Left config
@@ -1760,9 +2573,9 @@ class CompareSubMode(tk.Frame):
 
         self._param_entries = {}
         for label, key, default in [
-            ("N Simulations", "n_sim", "5000"),
+            ("N Simulations", "n_sim", str(cfg.N_SIMULATIONS)),
             ("Horizon (Years)", "horizon", "10"),
-            ("Block Size", "block", "6"),
+            ("Block Size", "block", str(cfg.BLOCK_SIZE)),
             ("Seed", "seed", "42"),
             ("Date Start", "date_start", ""),
             ("Date End", "date_end", ""),
@@ -1806,7 +2619,7 @@ class CompareSubMode(tk.Frame):
         self.plot_frame.pack(side="left", fill="both", expand=True)
 
         # Bottom: summary table
-        self.table_frame = tk.Frame(self, bg=BG)
+        self.table_frame = tk.Frame(outer, bg=BG)
         self.table_frame.pack(fill="both", expand=True, padx=PAD, pady=(0, PAD))
 
     def refresh_list(self):
@@ -1847,6 +2660,7 @@ class CompareSubMode(tk.Frame):
 
         self.running = True
         self.results = {}
+        self._shared_window = None
         self.progress_var.set(0)
         self.run_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -1878,6 +2692,42 @@ class CompareSubMode(tk.Frame):
                           n_sim, horizon, block, seed)
             _gui_log.info("[SINGLE] Date filter: [%s, %s]  hist_start=%s",
                           date_start or "*", date_end or "*", hist_start or "None")
+
+            # Every selected portfolio is evaluated on ONE shared
+            # historical window (the intersection across the union of
+            # their tickers). Loading each on its own window would rank
+            # them against each other over DIFFERENT periods — silently
+            # rewarding whichever portfolio happens to hold assets with
+            # longer histories. Measured on this repo's data, that flips
+            # the ranking outright (see
+            # engine.data.load_portfolios_on_common_window). Independent
+            # mode is exempt: it deliberately never aligns assets to a
+            # common calendar at all.
+            common_tickers = None
+            common_matrix = None
+            common_weights: dict[str, np.ndarray] = {}
+            if not independent:
+                selected_portfolios = {}
+                for name in names:
+                    pf = _clean_portfolio(self.library.get(name))
+                    if not pf:
+                        self.result_queue.put(
+                            ("error", f"Portfolio '{name}' is empty or all-zero."))
+                        return
+                    selected_portfolios[name] = pf
+                common_tickers, common_matrix, common_weights = (
+                    load_portfolios_on_common_window(
+                        selected_portfolios, cfg.USE_AFTER_TER_RETURNS,
+                        date_start=date_start, date_end=date_end,
+                    )
+                )
+                _gui_log.info(
+                    "[SINGLE] Shared window across all %d portfolios: %d months "
+                    "(%d tickers: %s)", total, common_matrix.shape[0],
+                    len(common_tickers), common_tickers)
+                self.result_queue.put(
+                    ("window_info", common_matrix.shape[0], list(common_tickers)))
+
             for i, name in enumerate(names):
                 if not self.running:
                     _gui_log.info("[SINGLE] Run cancelled by user")
@@ -1917,13 +2767,17 @@ class CompareSubMode(tk.Frame):
                         portfolio, cfg.USE_AFTER_TER_RETURNS,
                         date_start=date_start, date_end=date_end,
                     )
+                    metrics_tickers = sorted(portfolio.keys())
                 else:
-                    weights_arr, ret_matrix = load_all_returns(
-                        portfolio, cfg.USE_AFTER_TER_RETURNS,
-                        date_start=date_start, date_end=date_end,
-                    )
-                    _gui_log.info("[SINGLE] Data loaded in %.3fs: matrix=%s  weights=%s",
-                                  time.perf_counter() - t0, ret_matrix.shape, weights_arr)
+                    # Shared window across every selected portfolio — see
+                    # the block above. weights_arr is zero-padded to the
+                    # union ticker list so all portfolios index the same
+                    # columns of the same matrix.
+                    weights_arr = common_weights[name]
+                    ret_matrix = common_matrix
+                    metrics_tickers = common_tickers
+                    _gui_log.info("[SINGLE] Shared-window data: matrix=%s  weights=%s",
+                                  ret_matrix.shape, weights_arr)
 
                     _gui_log.info("[SINGLE] Running Monte-Carlo simulation: "
                                   "%d sims × %d months (block=%d)...",
@@ -1938,7 +2792,7 @@ class CompareSubMode(tk.Frame):
                 t2 = time.perf_counter()
                 metrics = compute_metrics(
                     paths, horizon, horizon * 12, block_size=block, weights=weights_arr,
-                    tickers=sorted(portfolio.keys()),
+                    tickers=metrics_tickers,
                 )
                 _gui_log.info("[SINGLE] Metrics computed in %.3fs: %s",
                               time.perf_counter() - t2,
@@ -1951,13 +2805,28 @@ class CompareSubMode(tk.Frame):
                     # Use user-specified historical start for horizon years
                     try:
                         yr, mo = int(hist_start.split("-")[0]), int(hist_start.split("-")[1])
-                        end_yr = yr + horizon
-                        hist_end = f"{end_yr:04d}-{mo:02d}"
+                        # date filters are INCLUSIVE at both ends, so the end
+                        # month must be one month before the horizon-years-later
+                        # anniversary — otherwise [hist_start, end] spans
+                        # horizon*12 + 1 months, one more than the simulation
+                        # itself (horizon*12), and the overlay silently runs
+                        # a month longer than the fan chart it's drawn on.
+                        if mo == 1:
+                            end_yr, end_mo = yr + horizon - 1, 12
+                        else:
+                            end_yr, end_mo = yr + horizon, mo - 1
+                        hist_end = f"{end_yr:04d}-{end_mo:02d}"
                         _gui_log.info("[SINGLE] Historical window: %s → %s", hist_start, hist_end)
-                        w_hist, ret_hist = load_all_returns(
-                            portfolio, cfg.USE_AFTER_TER_RETURNS,
+                        # Union ticker set again (see the shared-window
+                        # block above): every compared portfolio's
+                        # historical line must cover the same months, or
+                        # the lines drawn on one chart start on different
+                        # dates and span different periods.
+                        _, ret_hist, w_hist_map = load_portfolios_on_common_window(
+                            selected_portfolios, cfg.USE_AFTER_TER_RETURNS,
                             date_start=hist_start, date_end=hist_end,
                         )
+                        w_hist = w_hist_map[name]
                         # errstate: Apple Accelerate BLAS false positives
                         with np.errstate(all="ignore"):
                             port_hist = ret_hist @ w_hist
@@ -1998,6 +2867,7 @@ class CompareSubMode(tk.Frame):
                         "weights_arr": weights_arr,
                         "historical": cum_hist,
                         "hist_label": hist_label,
+                        "block_size": block,
                     },
                     i + 1, total
                 ))
@@ -2026,6 +2896,9 @@ class CompareSubMode(tk.Frame):
                     self.run_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
                     return
+                elif msg[0] == "window_info":
+                    _, n_months, tickers = msg
+                    self._shared_window = (n_months, tickers)
                 elif msg[0] == "result":
                     _, name, data, done, total = msg
                     self.results[name] = data
@@ -2080,7 +2953,16 @@ class CompareSubMode(tk.Frame):
         for ni, name in enumerate(names):
             paths = self.results[name]["paths"]
             n_steps = paths.shape[1]
-            years = np.linspace(0, horizon, n_steps)
+            block_size = self.results[name].get("block_size", 1)
+            # Each path column spans block_size months, so its year label is
+            # k*block_size/12 — NOT np.linspace(0, horizon, n_steps), which
+            # spreads the columns evenly across [0, horizon] regardless of
+            # block_size. Those only coincide when block_size divides the
+            # horizon evenly; otherwise (the final block gets truncated —
+            # see engine.simulation.simulate) linspace stretches the last
+            # column out to the nominal horizon even though fewer months
+            # were actually simulated.
+            years = np.arange(n_steps) * block_size / 12.0
 
             for lo, hi, alpha in bands:
                 p_lo = np.percentile(paths, lo, axis=0)
@@ -2094,7 +2976,12 @@ class CompareSubMode(tk.Frame):
             # Historical overlay with user-selected or full date range
             hist = self.results[name]["historical"]
             hist_label = self.results[name].get("hist_label", "Historical")
-            hist_years = np.linspace(0, len(hist) / 12, len(hist))
+            # One point per month, exactly 1/12 year apart (point 0 = t0).
+            # np.linspace(0, len(hist)/12, len(hist)) instead spaces
+            # len(hist) points across [0, len(hist)/12] — dividing by
+            # (len(hist) - 1), not len(hist) — which stretches the
+            # x-axis slightly past where each month actually falls.
+            hist_years = np.arange(len(hist)) / 12.0
             # Clip to horizon
             mask = hist_years <= horizon
             ax.plot(hist_years[mask], hist[mask], color=TEXT, linewidth=1,
@@ -2186,18 +3073,37 @@ class CompareSubMode(tk.Frame):
         FieldLabel(frame, text="Summary Statistics", bg=PANEL_BG).pack(
             anchor="w", padx=PAD, pady=(PAD, 0)
         )
+        # State the shared window explicitly: these portfolios are only
+        # comparable because they were all measured on the same months,
+        # and that window is set by whichever SELECTED ticker has the
+        # shortest history — so it changes as the selection changes.
+        if self._shared_window is not None:
+            n_months, tickers = self._shared_window
+            FieldLabel(
+                frame,
+                text=(f"All portfolios evaluated on the same {n_months} months "
+                      f"({n_months / 12:.1f}y) — the overlap across "
+                      f"{len(tickers)} tickers in the current selection"),
+                bg=PANEL_BG,
+            ).pack(anchor="w", padx=PAD)
 
+        # Vertical scrolling is handled by the outer ScrollableFrame this
+        # table lives in, so this canvas only needs to grow tall enough to
+        # show every metric row (including drawdown) without clipping —
+        # it keeps its own horizontal scrollbar for when many portfolios
+        # are compared side by side.
         canvas = tk.Canvas(frame, bg=PANEL_BG, highlightthickness=0)
         h_scroll = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
-        v_scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
         table_inner = tk.Frame(canvas, bg=PANEL_BG)
-        table_inner.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=table_inner, anchor="nw")
-        canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
 
-        v_scroll.pack(side="right", fill="y")
+        def _on_inner_configure(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"),
+                             height=table_inner.winfo_reqheight())
+
+        table_inner.bind("<Configure>", _on_inner_configure)
+        canvas.create_window((0, 0), window=table_inner, anchor="nw")
+        canvas.configure(xscrollcommand=h_scroll.set)
+
         h_scroll.pack(side="bottom", fill="x")
         canvas.pack(side="left", fill="both", expand=True)
 
@@ -2289,7 +3195,7 @@ class SweepSubMode(tk.Frame):
         for label, key, default in [
             ("Block Size Min", "bs_min", "1"),
             ("Block Size Max", "bs_max", "36"),
-            ("N Simulations", "n_sim", "30000"),
+            ("N Simulations", "n_sim", str(cfg.N_SIMULATIONS)),
             ("Horizon (Years)", "horizon", "10"),
             ("Seed", "seed", "42"),
             ("Date Start", "date_start", ""),
@@ -2386,6 +3292,7 @@ class SweepSubMode(tk.Frame):
                 portfolio, cfg.USE_AFTER_TER_RETURNS,
                 date_start=date_start, date_end=date_end,
             )
+            sweep_tickers = sorted(portfolio.keys())
             _gui_log.info("[SWEEP] Data loaded in %.3fs: matrix=%s",
                           time.perf_counter() - t0, ret_matrix.shape)
             block_sizes = list(range(bs_min, bs_max + 1))
@@ -2403,6 +3310,7 @@ class SweepSubMode(tk.Frame):
                 m = run_bootstrap_preloaded(
                     weights_arr, ret_matrix,
                     n_sim=n_sim, horizon_years=horizon, block_size=bs, rng=rng,
+                    tickers=sweep_tickers,
                 )
                 m["block_size"] = bs
                 records.append(m)

@@ -105,8 +105,20 @@ def simulate(
         block_gross_all = _precompute_block_gross(weights, returns, block_size)
         n_avail = len(block_gross_all)
 
-        # 2) Sample n_blocks per simulation
+        # 2) Sample n_blocks per simulation. Floor division: a block_size
+        # that doesn't evenly divide horizon_months truncates the final
+        # partial block (see the module-level metrics-side compensation in
+        # compute_metrics, which annualises by the months ACTUALLY
+        # simulated here, not the nominal horizon). block_size larger than
+        # the whole horizon would floor to 0 simulated months — a
+        # degenerate "portfolio" whose every metric is silently 0 — so
+        # that case is rejected outright instead.
         n_blocks = horizon_months // block_size
+        if n_blocks < 1:
+            raise ValueError(
+                f"block_size={block_size} exceeds horizon_months={horizon_months} — "
+                f"produces zero simulated steps. Reduce block_size or increase the horizon."
+            )
         idx = rng.integers(0, n_avail, size=(n_sim, n_blocks))
         gross = block_gross_all[idx]              # (S, n_blocks)
 
@@ -238,6 +250,11 @@ def simulate_independent(
     else:
         # ── block bootstrap: per-asset independent block sampling ─────
         n_blocks = horizon_months // block_size
+        if n_blocks < 1:
+            raise ValueError(
+                f"block_size={block_size} exceeds horizon_months={horizon_months} — "
+                f"produces zero simulated steps. Reduce block_size or increase the horizon."
+            )
         # Pre-compute rolling block gross returns for each asset
         block_gross_per_asset = []
         for a in range(n_assets):

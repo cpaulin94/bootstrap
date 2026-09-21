@@ -20,7 +20,9 @@ uv run pytest           # engine + lifecycle test suite
   where all numerical logic lives, including `engine/lifecycle.py` (the
   Life Strategy Simulator's math — see its module docstring for the exact
   formulas: monthly block bootstrap, average-cost capital-gains tax,
-  inflation indexing).
+  inflation indexing) and `engine/plotprep.py` (result dicts → numeric
+  matrices, plus the density-preserving thinning the Space Explorer's
+  scatter needs to stay interactive at 100k points).
 - `bootstrap_gui/` — shared UI infrastructure: `theme.py` (design tokens +
   `ttk.Style`), `widgets.py` (themed widgets), `runner_mixin.py`
   (`BackgroundJobMixin` — the thread/queue/poll pattern, used by every
@@ -64,6 +66,39 @@ uv run pytest           # engine + lifecycle test suite
   `ttk.Frame` for an unstyled rectangle. `tk.Listbox` / `tk.Text` /
   `tk.Canvas` have no `ttk` equivalent; style them explicitly with the
   tokens from `bootstrap_gui.theme`.
+- **Nothing per-point in a Plotly figure is a Python string.** The Space
+  Explorer routinely plots 100k portfolios; a pre-rendered hover string
+  and a `{ticker: weight}` dict per point is what used to write a 137 MB
+  `results/scatter.html`. Use one `hovertemplate` plus a numeric
+  `customdata` matrix (plotly base64-encodes numpy arrays), and thin the
+  cloud with `engine.plotprep.thin_scatter` before it leaves Python.
+- **`sim_seed` cancels relative noise, not absolute.** Every candidate in
+  a multi-bootstrap run shares one `sim_seed` (common random numbers) so
+  score DIFFERENCES between portfolios reflect weights, not sampling —
+  see `run_multi_streaming`'s docstring in `engine/runner.py`. But the
+  whole cloud still rides on that one shared draw, and moves by up to
+  ~0.7pp (p50) / ~2pp (p1) at `n_sim=1000` depending on which `sim_seed`
+  was used. Never compare a cloud/overlay computed with one `sim_seed`
+  against one computed with another — an overlay point especially must be
+  computed against the exact same data + `sim_seed` as the cloud it's
+  drawn on, see `bootstrap_gui.assets.overlay_key`.
+- **Evolutionary search keeps one Pool alive across all generations.**
+  `run_evolutionary_streaming` (`engine/runner.py`) opens the
+  multiprocessing `Pool` once, before the generation loop, not once per
+  generation — spawning workers is slow (measured: several seconds for a
+  ~20-worker Pool), which would dominate total run time otherwise. This
+  also means `sim_seed` is fixed for the entire run by construction (the
+  same `_init_worker` params dict is reused every generation), which is
+  required, not incidental: comparing a later generation's candidate
+  against an earlier one only means anything if they share a draw — same
+  rule as `sim_seed` above, just across generations instead of across a
+  single batch.
+- **The Space Explorer chart is a shell page, not a written-out figure.**
+  `results/scatter.html` fetches `figure.json` and `Plotly.react`s it,
+  polling the click server's `/version`; a regenerated chart therefore
+  lands in the already-open tab (zoom preserved via `uirevision`) instead
+  of needing a manual reload. `fig.write_html` is only the fallback for
+  when the local click server couldn't bind a port.
 - Numbers formatted for the UI go through `bootstrap_gui/fmt.py`
   (`money`, `pct`, `ratio`) — don't hand-roll `f"{x:.1%}"` in a new call site.
 

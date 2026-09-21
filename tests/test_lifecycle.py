@@ -160,6 +160,62 @@ def test_lump_sum_rebirth_no_tax_on_immediate_withdrawal():
     assert np.allclose(result.values[:, 2], 48_000.0)
 
 
+# ── 6b. M5: negative lump sum exceeding the portfolio is tracked, not silent ─
+
+def test_lump_outflow_shortfall_is_tracked_when_portfolio_cannot_cover_it():
+    """A negative lump sum (e.g. a house purchase) is grossed-up and capped
+    at whatever's available, exactly like a withdrawal. Before this fix,
+    the shortfall (net_received < requested) was computed by
+    _apply_inflow_or_lump but discarded by the caller — the plan looked
+    like it "worked" even though the investor got less than they asked
+    for."""
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=120_000.0, tax_rate_pct=0.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=3,
+        phases=[Phase(kind=PhaseKind.HOLD, years=5)],
+        lump_sums=[LumpSum(at_year=1.0, amount=-300_000.0, label="house")],
+    )
+    monthly = np.zeros((3, 60))
+    result = _simulate_from_monthly_returns(plan, monthly)
+
+    i = 11  # month 12 = at_year 1.0
+    assert result.lump_outflow_requested[i] == pytest.approx(300_000.0)
+    np.testing.assert_allclose(result.lump_outflow_received[:, i], 120_000.0)
+    assert result.values[0, i + 1] == pytest.approx(0.0)
+    assert result.summary()["probability_of_lump_sum_shortfall"] == pytest.approx(1.0)
+
+
+def test_lump_outflow_within_means_has_no_shortfall():
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=500_000.0, tax_rate_pct=0.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=3,
+        phases=[Phase(kind=PhaseKind.HOLD, years=5)],
+        lump_sums=[LumpSum(at_year=1.0, amount=-50_000.0, label="car")],
+    )
+    monthly = np.zeros((3, 60))
+    result = _simulate_from_monthly_returns(plan, monthly)
+
+    i = 11
+    assert result.lump_outflow_requested[i] == pytest.approx(50_000.0)
+    np.testing.assert_allclose(result.lump_outflow_received[:, i], 50_000.0)
+    assert result.summary()["probability_of_lump_sum_shortfall"] == pytest.approx(0.0)
+
+
+def test_lump_inflow_never_flagged_as_outflow_shortfall():
+    # Positive lump sums (inflows) always succeed exactly by construction —
+    # only negative ones (outflows) are tracked at all.
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=0.0, tax_rate_pct=0.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=3,
+        phases=[Phase(kind=PhaseKind.HOLD, years=5)],
+        lump_sums=[LumpSum(at_year=1.0, amount=50_000.0, label="inheritance")],
+    )
+    monthly = np.zeros((3, 60))
+    result = _simulate_from_monthly_returns(plan, monthly)
+    assert np.all(result.lump_outflow_requested == 0.0)
+    assert result.summary()["probability_of_lump_sum_shortfall"] == pytest.approx(0.0)
+
+
 # ── 7. Inflation indexing of contributions ──────────────────────────────────
 
 def test_inflation_indexing_matches_geometric_series():
@@ -447,6 +503,57 @@ def test_drawdown_curtailment_switches_target_month_by_month():
     np.testing.assert_allclose(result.realised_withdrawals[0], expected_targets)
 
 
+# ── H3: DRAWDOWN_CURTAILED reads a market-only signal, not the balance ──────
+
+def test_drawdown_curtailed_never_triggers_in_a_monotonically_rising_market():
+    """The trigger is a MARKET drawdown. A market that goes up every single
+    month has zero market drawdown, ever — so the curtailment must never
+    fire, no matter how much has been withdrawn (spending alone must not
+    look like a market crash)."""
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=1_000_000.0, tax_rate_pct=26.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=1,
+        phases=[Phase(
+            kind=PhaseKind.WITHDRAW, years=20, monthly_amount=4_000.0,
+            withdrawal_style=WithdrawalStyle.DRAWDOWN_CURTAILED,
+            reduced_monthly_amount=2_500.0, drawdown_threshold_pct=5.0,
+        )],
+    )
+    monthly = np.full((1, 240), 0.004)   # +0.4%/month, every month, forever
+    result = _simulate_from_monthly_returns(plan, monthly)
+    assert np.all(result.withdrawal_requested[0] == pytest.approx(4_000.0))
+
+
+def test_drawdown_curtailed_ignores_peak_inflated_by_a_prior_accumulate_phase():
+    """A balance-based trigger would carry the ACCUMULATE phase's peak
+    (inflated by contributions) into the WITHDRAW phase, so a flat market
+    there — no market drawdown at all — could still read as a deep
+    "drawdown" purely because contributions stopped. The market-only index
+    resets its own reference at 1.0 when the simulation starts, so it must
+    stay at dd=0 (full target) through a flat market regardless of what an
+    earlier phase's balance did."""
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=10_000.0, tax_rate_pct=0.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=1,
+        phases=[
+            Phase(kind=PhaseKind.ACCUMULATE, years=5, monthly_amount=2_000.0),
+            Phase(
+                kind=PhaseKind.WITHDRAW, years=5, monthly_amount=500.0,
+                withdrawal_style=WithdrawalStyle.DRAWDOWN_CURTAILED,
+                reduced_monthly_amount=100.0, drawdown_threshold_pct=5.0,
+            ),
+        ],
+    )
+    # Flat market throughout: 0% every month. The ACCUMULATE phase still
+    # builds a large balance (peak) purely from contributions; the
+    # WITHDRAW phase then only ever spends it down — a balance-based
+    # trigger would misread that steady decline as a market drawdown.
+    monthly = np.zeros((1, plan.horizon_months))
+    result = _simulate_from_monthly_returns(plan, monthly)
+    withdraw_targets = result.withdrawal_requested[0, 60:]   # the WITHDRAW phase's months
+    assert np.all(withdraw_targets == pytest.approx(500.0))
+
+
 # ── Percentage-of-portfolio: exact target, gross-up passthrough ─────────────
 
 def test_percentage_of_portfolio_target_matches_v_before_withdrawal():
@@ -518,6 +625,58 @@ def test_summary_real_total_contributed_matches_closed_form():
     summary_nominal = result.summary(real=False)
     expected_nominal = float(result.planned_contributions.sum())
     assert summary_nominal["total_contributed"] == pytest.approx(expected_nominal, rel=1e-9)
+
+
+# ── shortfall_months_median: must compare each sim to its OWN target ────────
+
+def test_shortfall_months_zero_for_percentage_style_that_never_exhausts():
+    """PERCENTAGE_OF_PORTFOLIO always withdraws exactly what it asks for
+    (the target itself is a fraction of current V, so it can never exceed
+    V) — every simulation's realised withdrawal exactly equals its own
+    requested target, so the true shortfall count is 0 for every sim.
+    Comparing against the CROSS-SIMULATION MEDIAN target instead of each
+    sim's own target used to flag every below-median path as a false
+    shortfall."""
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=1_000_000, tax_rate_pct=26.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=500, seed=1,
+        phases=[Phase(kind=PhaseKind.WITHDRAW, years=10,
+                      withdrawal_style=WithdrawalStyle.PERCENTAGE_OF_PORTFOLIO,
+                      withdrawal_pct_per_month=0.3)],
+    )
+    rng = np.random.default_rng(1)
+    monthly = rng.normal(0.005, 0.04, size=(plan.n_sim, plan.horizon_months))
+    result = _simulate_from_monthly_returns(plan, monthly)
+
+    # Ground truth: shortfall only exists where a sim received less than
+    # ITS OWN request (which, for this style, never happens).
+    truth = np.median(np.sum(
+        (result.withdrawal_requested > 0)
+        & (result.realised_withdrawals < result.withdrawal_requested - 1e-9),
+        axis=1,
+    ))
+    assert truth == 0.0
+    assert result.summary()["shortfall_months_median"] == pytest.approx(0.0)
+
+
+def test_shortfall_months_matches_per_simulation_ground_truth_fixed_style():
+    """For a FIXED-style withdrawal every sim's target equals the plan-wide
+    median exactly, so this must be unaffected by the H2 fix."""
+    plan = LifePlan(
+        portfolio_name="x", initial_capital=50_000, tax_rate_pct=26.0,
+        inflation_pct=0.0, adjust_for_inflation=False, n_sim=200, seed=2,
+        phases=[Phase(kind=PhaseKind.WITHDRAW, years=10, monthly_amount=2000)],
+    )
+    rng = np.random.default_rng(2)
+    monthly = rng.normal(-0.01, 0.05, size=(plan.n_sim, plan.horizon_months))
+    result = _simulate_from_monthly_returns(plan, monthly)
+
+    truth = np.median(np.sum(
+        (result.withdrawal_requested > 0)
+        & (result.realised_withdrawals < result.withdrawal_requested - 1e-9),
+        axis=1,
+    ))
+    assert result.summary()["shortfall_months_median"] == pytest.approx(truth)
 
 
 # ── cash_flow_at / cash_flow_bands consistency ───────────────────────────────

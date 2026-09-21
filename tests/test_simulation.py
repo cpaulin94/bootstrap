@@ -35,6 +35,26 @@ def test_simulate_shape_block_size_greater_than_one():
     assert np.all(paths[:, 0] == 1.0)
 
 
+def test_simulate_block_size_exceeding_horizon_raises():
+    """block_size > horizon_months used to floor n_blocks to 0 and silently
+    return a degenerate (n_sim, 1) path — every downstream metric would
+    then read as 0 with no error. Must raise instead."""
+    returns = _fake_returns(0)
+    weights = np.array([0.5, 0.3, 0.2])
+    rng = np.random.default_rng(42)
+    with pytest.raises(ValueError):
+        simulate(weights, returns, n_sim=10, horizon_months=6, rng=rng, block_size=12)
+
+
+def test_simulate_independent_block_size_exceeding_horizon_raises():
+    returns_list = [_fake_returns(i, n_months=120, n_assets=1)[:, 0] for i in range(2)]
+    weights = np.array([0.5, 0.5])
+    rng = np.random.default_rng(42)
+    with pytest.raises(ValueError):
+        simulate_independent(weights, returns_list, n_sim=10, horizon_months=6,
+                             rng=rng, block_size=12)
+
+
 def test_simulate_paths_are_positive_and_finite():
     returns = _fake_returns(1)
     weights = np.array([1.0, 0.0, 0.0])
@@ -130,3 +150,47 @@ def test_simulate_independent_shape():
     assert paths.shape == (40, 25)
     assert np.all(paths[:, 0] == 1.0)
     assert np.all(np.isfinite(paths))
+
+
+# ── The horizon is a path LENGTH, never a window into the history ─────────
+#
+# A 10-year horizon must draw its 120 months from the whole aligned
+# history (33 years of it, for a typical portfolio), not from the first
+# 120 rows of the series. These pin that down.
+
+def test_horizon_samples_from_the_whole_history_not_its_first_months():
+    # Flat for the first 120 months, +1%/month afterwards. A simulation
+    # confined to the first 10 years of history could only ever end at
+    # 1.0; drawing from all 40 years must produce growth.
+    returns = np.zeros((480, 1))
+    returns[120:] = 0.01
+    paths = simulate(np.array([1.0]), returns, n_sim=500, horizon_months=120,
+                     rng=np.random.default_rng(0), block_size=1)
+    terminal = paths[:, -1]
+    assert not np.any(np.isclose(terminal, 1.0))
+    # 3/4 of the history yields +1%, so each drawn month is 1.01 with
+    # p=0.75 → E[log wealth] = 120 * 0.75 * log(1.01), i.e. a median
+    # terminal wealth near exp(0.8955) ≈ 2.45.
+    assert 2.0 < float(np.median(terminal)) < 3.0
+
+
+def test_block_bootstrap_horizon_also_reaches_the_end_of_the_history():
+    returns = np.zeros((480, 1))
+    returns[120:] = 0.01
+    paths = simulate(np.array([1.0]), returns, n_sim=500, horizon_months=120,
+                     rng=np.random.default_rng(0), block_size=12)
+    assert not np.any(np.isclose(paths[:, -1], 1.0))
+
+
+def test_a_month_is_drawn_across_all_assets_at_once():
+    # Cross-asset correlation survives the bootstrap because whole rows
+    # are sampled: asset 1 is asset 0 negated, so the drawn columns must
+    # stay perfectly anti-correlated.
+    rng = np.random.default_rng(3)
+    col = rng.normal(0.004, 0.03, size=(360, 1))
+    returns = np.hstack([col, -col])
+    # 50/50 of an asset and its exact opposite is a flat portfolio, in
+    # every month of history and therefore in every simulated path.
+    paths = simulate(np.array([0.5, 0.5]), returns, n_sim=200,
+                     horizon_months=120, rng=rng, block_size=1)
+    np.testing.assert_allclose(paths, 1.0)

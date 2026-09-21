@@ -5,5 +5,8 @@ __pycache__/
 *.zip
 results/*.csv
 results/*.html
+results/figure.json
+results/plotly.min.js
+results/plotly.version
 token
 prompt

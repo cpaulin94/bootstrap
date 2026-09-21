@@ -79,6 +79,44 @@ def clean_portfolio(portfolio: dict) -> dict:
     return {t: w for t, w in portfolio.items() if w > 1e-9}
 
 
+def overlay_key(
+    params: dict,
+    sorted_tickers: list[str] | None,
+    sim_seed: int | None,
+) -> tuple:
+    """Identity of the context an overlay's metrics were computed in.
+
+    Two overlays are only comparable with the same cloud if this key
+    matches. Simulation params alone are NOT enough: the historical date
+    window (derived from the FULL set of search-space tickers, via
+    ``sorted_tickers``) and the Monte-Carlo draw (``sim_seed``) shift an
+    overlay by far more than the difference between nearby portfolios —
+    an overlay computed against a different ticker set or a different
+    seed can land tens of standard deviations from a cloud it looks like
+    it should sit inside.
+    """
+    return (
+        tuple(sorted(params.items())),
+        tuple(sorted(sorted_tickers)) if sorted_tickers else None,
+        sim_seed,
+    )
+
+
+def default_pareto_direction(metric_name: str) -> str:
+    """Infer whether a metric should be maximised or minimised on a Pareto
+    frontier, from its naming convention (see :func:`build_metric_list`):
+    returns and diversification counts are "more is better", every
+    volatility/drawdown metric is "less is better".
+
+    Used to seed the Pareto-objective checkboxes' default direction —
+    every name `build_metric_list` can produce is covered, so this never
+    falls through to a guess for a metric the app actually reports.
+    """
+    if metric_name.startswith("annualised_return") or metric_name.startswith("effective_n_"):
+        return "maximize"
+    return "minimize"  # volatility_*, max_dd_*, mda_*
+
+
 def build_metric_list() -> list[str]:
     """Build the metric dropdown list dynamically from engine config.
 
@@ -94,6 +132,6 @@ def build_metric_list() -> list[str]:
             f"max_dd_length_months_p{bp}",
             f"mda_months_p{bp}",
         ]
-        + ["shannon_entropy"]
-        + ["type_entropy"]
+        + ["effective_n_assets"]
+        + ["effective_n_types"]
     )

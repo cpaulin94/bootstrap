@@ -11,32 +11,59 @@ from engine.metrics import (
     _max_drawdown_length,
     _drawdown_series,
     compute_metrics,
-    shannon_entropy,
+    effective_n_assets,
 )
 
 
 # ── Shannon entropy ──────────────────────────────────────────────────────────
 
-def test_shannon_entropy_single_asset_is_zero():
-    assert shannon_entropy(np.array([1.0])) == 0.0
+def test_effective_n_assets_single_asset_is_one():
+    assert effective_n_assets(np.array([1.0])) == pytest.approx(1.0)
 
 
-def test_shannon_entropy_equal_weights_is_one():
+def test_effective_n_assets_equal_weights_is_the_asset_count():
     w = np.array([0.25, 0.25, 0.25, 0.25])
-    assert shannon_entropy(w) == pytest.approx(1.0, abs=1e-9)
+    assert effective_n_assets(w) == pytest.approx(len(w), abs=1e-6)
 
 
-def test_shannon_entropy_concentrated_below_equal():
-    equal = shannon_entropy(np.array([0.25, 0.25, 0.25, 0.25]))
-    concentrated = shannon_entropy(np.array([0.9, 0.05, 0.03, 0.02]))
+def test_effective_n_assets_concentrated_below_equal():
+    equal = effective_n_assets(np.array([0.25, 0.25, 0.25, 0.25]))
+    concentrated = effective_n_assets(np.array([0.9, 0.05, 0.03, 0.02]))
     assert 0.0 <= concentrated < equal
 
 
-def test_shannon_entropy_ignores_zero_weights():
+def test_effective_n_assets_ignores_zero_weights():
     # Zero-weight entries must not produce NaN (0 * log(0) undefined).
     w = np.array([0.5, 0.5, 0.0, 0.0])
-    val = shannon_entropy(w)
+    val = effective_n_assets(w)
     assert np.isfinite(val)
+
+
+def test_effective_n_assets_is_independent_of_zero_padding():
+    """The metric must describe the PORTFOLIO, not the weight vector it
+    happens to be encoded in. The old normalised shannon_entropy divided
+    by ln(len(weights)), so the same holdings scored 0.84 from the Single
+    Bootstrap section (2-long vector) and 0.22 from a Space Explorer run
+    (15-long zero-padded vector) — the same class of cross-tool
+    disagreement as evaluating them on different date windows."""
+    held = np.array([0.73, 0.27])
+    for pad in (0, 3, 13):
+        padded = np.concatenate([held, np.zeros(pad)])
+        assert effective_n_assets(padded) == pytest.approx(
+            effective_n_assets(held), abs=1e-9
+        )
+
+
+def test_effective_n_assets_still_ranks_diversification_correctly():
+    """exp(H) is a monotone transform of H, so within one run (where the
+    old denominator was constant) every ranking is unchanged — an
+    equal-weight 5-asset portfolio must still beat an equal-weight
+    3-asset one, which the ln(n_held)-normalised alternative would not."""
+    eq3 = np.concatenate([np.ones(3) / 3, np.zeros(12)])
+    eq5 = np.concatenate([np.ones(5) / 5, np.zeros(10)])
+    assert effective_n_assets(eq5) > effective_n_assets(eq3)
+    assert effective_n_assets(eq3) == pytest.approx(3.0, abs=1e-6)
+    assert effective_n_assets(eq5) == pytest.approx(5.0, abs=1e-6)
 
 
 # ── Drawdown: naive reference vs. engine implementation ─────────────────────
@@ -161,6 +188,45 @@ def test_compute_metrics_contains_expected_keys():
         "annualised_return_p1", "annualised_return_p50", "annualised_return_p99",
         "volatility_1y", "volatility_5y", "volatility_10y",
         "max_dd_depth_p2", "max_dd_length_months_p2", "mda_months_p2",
-        "shannon_entropy", "type_entropy",
+        "effective_n_assets", "effective_n_types",
     ):
         assert key in metrics, f"missing key: {key}"
+
+
+# ── compute_metrics: block_size truncation annualises against actual months ──
+
+def test_compute_metrics_annualises_against_actual_months_simulated():
+    """A block_size that doesn't evenly divide horizon_months truncates the
+    final partial block (see engine.simulation.simulate). compute_metrics
+    must annualise against the months ACTUALLY simulated
+    (paths.shape[1] - 1) * block_size, not the nominal horizon_months —
+    otherwise identical per-month growth reports a different annualised
+    return purely because of the block_size, which is a bootstrap-sampling
+    knob and shouldn't change the answer for a deterministic path.
+    """
+    n_sim = 10
+    monthly_growth = 1.01               # deterministic +1%/month
+    # 9 blocks of 13 months = 117 months actually simulated (nominal
+    # horizon is 120 months, so block_size=13 doesn't divide it evenly).
+    n_steps = 9
+    gross = np.full((n_sim, n_steps), monthly_growth ** 13)
+    cum = np.cumprod(gross, axis=1)
+    paths = np.hstack([np.ones((n_sim, 1)), cum])
+
+    metrics = compute_metrics(
+        paths, horizon_years=10, horizon_months=120, block_size=13,
+        percentiles=[50], vol_windows=[], bad_pct=2,
+    )
+    expected_ann = monthly_growth ** 12 - 1.0
+    assert metrics["annualised_return_p50"] == pytest.approx(expected_ann, abs=1e-6)
+    # Sanity: using the WRONG (nominal) horizon would have given a
+    # different, incorrect number for the same deterministic path.
+    wrong_ann = paths[0, -1] ** (1.0 / 10) - 1.0
+    assert metrics["annualised_return_p50"] != pytest.approx(wrong_ann, abs=1e-6)
+
+
+def test_compute_metrics_raises_on_zero_simulated_steps():
+    paths = np.ones((5, 1))   # only the t=0 column — nothing was simulated
+    with pytest.raises(ValueError):
+        compute_metrics(paths, horizon_years=10, horizon_months=120, block_size=1,
+                        percentiles=[50], vol_windows=[], bad_pct=2)

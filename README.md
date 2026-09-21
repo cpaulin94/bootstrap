@@ -185,12 +185,19 @@ simulation, because it depends on how that particular simulated market behaved.
 - **Fixed** — the target is `monthly_amount` (today's €), indexed to inflation exactly like an
   ACCUMULATE contribution. This is the only style available before this feature existed.
 - **Drawdown-curtailed** — normally withdraws the FULL target, but cuts to a lower REDUCED floor
-  in any month where that simulation's drawdown from its own historical peak is at or beyond a
-  custom trigger. Re-evaluated every month (not committed for a year), and the cut is binary (no
-  partial tapering). Drawdown uses the same peak-to-trough convention as
-  `engine.metrics._drawdown_series`: `dd = (running_max - V) / running_max`, where `running_max`
-  is that simulation's highest portfolio value so far. The cut applies when `dd >= threshold`.
-  Both the full and reduced amounts grow together under the phase's real-growth rate.
+  in any month where that simulation's **market** (not the account balance — see below) is at or
+  beyond a custom drawdown from its own historical peak. Re-evaluated every month (not committed
+  for a year), and the cut is binary (no partial tapering). Drawdown uses the same peak-to-trough
+  convention as `engine.metrics._drawdown_series`: `dd = (peak - value) / peak`, applied to a
+  **cash-flow-neutral market index** — a running product of the sampled monthly returns alone,
+  untouched by contributions, withdrawals, or lump sums — not to the account balance `V` itself.
+  The cut applies when `dd >= threshold`. Both the full and reduced amounts grow together under
+  the phase's real-growth rate.
+
+  This is deliberate: `V`'s own peak is inflated by past contributions and eroded by past
+  withdrawals, so a balance-based trigger fires from spending alone — even with the market flat
+  or rising — and lets a prior ACCUMULATE phase's peak leak into a later WITHDRAW phase's
+  baseline. The market-only index avoids both.
 - **% of portfolio** — the NET target each month is `withdrawal_pct_per_month`% of that
   simulation's *current* portfolio value (before that month's withdrawal). The target scales
   automatically with the market — no separate inflation indexing applies, since it is already
@@ -245,17 +252,28 @@ Two panels, sharing an x-axis in years:
 
 ## Metrics
 
-### Shannon entropy (normalised)
+### Effective number of assets / types
 
-A weight-based metric (no bootstrap needed). Measures portfolio diversification:
+Weight-based metrics (no bootstrap needed). Measure portfolio
+diversification as the **effective count** of holdings — the perplexity
+of the weight vector:
 
-$$H_{\text{norm}} = \frac{-\sum w_i \ln w_i}{\ln N} \in [0, 1]$$
+$$N_{\text{eff}} = \exp\left(-\sum_{w_i > 0} w_i \ln w_i\right)$$
 
-- 0 = single asset
-- 1 = equal-weight across all N assets
+- 1.0 = single asset
+- exactly $k$ for $k$ equal-weighted assets
+- between the two for anything concentrated — e.g. `[0.9, 0.05, 0.03, 0.02]`
+  is "effectively 1.4 assets"
 
-Included automatically in `compute_metrics()` when weights are provided,
-and in every row of multi-bootstrap results.
+`effective_n_assets` applies this to the raw weight vector; `effective_n_types`
+first aggregates weights by asset-class TYPE (from `TER_table.csv`), so two
+equally-weighted STOCK tickers count as one type. Both are invariant to how
+many zero-weight assets happen to pad the weight vector — unlike a
+`ln(N)`-normalised entropy, which scores the SAME holdings differently
+depending on the length of the container they're encoded in (see AUDIT.md
+M12). Included automatically in `compute_metrics()` when weights (and,
+for `effective_n_types`, tickers) are provided, and in every row of
+multi-bootstrap results.
 
 ### Annualised return percentiles
 
@@ -289,9 +307,84 @@ PARETO_METRICS = [
     {"name": "annualised_return_p1",   "direction": "maximize"},
     {"name": "volatility_10y",         "direction": "minimize"},
     {"name": "max_dd_depth_p2",        "direction": "minimize"},
-    # {"name": "shannon_entropy",      "direction": "maximize"},
+    # {"name": "effective_n_assets",   "direction": "maximize"},
 ]
 ```
+
+This is also editable at runtime from the Space Explorer's **Pareto
+Objectives** panel — a checkbox per metric `build_metric_list()` can
+produce, defaulting to `PARETO_METRICS`'s current entries. The selection
+drives both the diamond markers/line drawn on the chart AND (see below)
+what an evolutionary search refines around; toggling a box invalidates
+the cached frontier and, if results are already loaded, redraws
+immediately.
+
+---
+
+## Search methods
+
+Four ways to generate the candidate portfolios a multi-bootstrap search
+evaluates (`engine/search.py`; selected via the Space Explorer's Search
+Mode radio buttons or `run_multi_streaming(method=...)`):
+
+- **`"mixed"`** (default) — a 40/40/20 blend of `sample_cdhr_portfolios`
+  (uniform coverage of the whole constrained simplex), `sample_sparse_portfolios`
+  (random-cardinality active subsets, for concentrated-in-a-few-assets
+  corners) and `sample_vertex_portfolios` (the polytope's extreme points).
+- **`"random"`** — box-uniform-then-normalise. Kept for reproducing old
+  runs; concentrates mass near the box's centroid as the number of assets
+  grows (see the function's docstring).
+- **`"grid"`** — exhaustive enumeration at a fixed step size.
+- **`"evolutionary"`** — see below.
+
+### Evolutionary search
+
+`run_evolutionary_streaming()` runs several GENERATIONS instead of one
+flat batch: generation 0 explores with `sample_mixed_portfolios`, same as
+the `"mixed"` method; every later generation spends most of its budget
+refining AROUND the Pareto frontier accumulated so far instead of
+sampling blind —
+
+- **Crossover** (`crossover_portfolios`): each child is a random convex
+  combination of two frontier portfolios. `{w: lo<=w<=hi, sum(w)=1}` is
+  the intersection of a box and a hyperplane — both convex — so any
+  convex combination of two feasible portfolios is itself feasible with
+  **zero repair step**.
+- **Local perturbation** (`local_perturb_portfolios`): a short
+  coordinate-direction-hit-and-run walk *starting from* a frontier point
+  instead of the box's centroid. Every intermediate state stays exactly
+  feasible by construction; few steps stay close to the seed (a cooling
+  schedule shortens the walk in later generations), many steps converge
+  to the same distribution as sampling from scratch.
+- **Fresh exploration** (`exploration_frac`, default 0.3 of each
+  generation) — kept even in later generations so the search doesn't
+  collapse onto whichever region generation 0 happened to find first.
+
+Which frontier points get refined around is biased by NSGA-II **crowding
+distance** (`engine.pareto.crowding_distance`): points in a sparse,
+under-explored stretch of the frontier are picked more often than ones
+already surrounded by close neighbours — pushing the frontier OUTWARD
+across generations instead of just thickening one region.
+
+`sim_seed` is fixed for the ENTIRE run (all generations share one
+multiprocessing Pool, initialised once) — the same common-random-numbers
+requirement as `run_multi_streaming` (see its docstring): without it,
+comparing a generation-3 candidate's score against a generation-0
+candidate's would be comparing Monte-Carlo luck, not portfolios.
+
+Measured on this repo's real 15-asset search space, equal total budget,
+5 generations: the evolutionary search's cumulative Pareto frontier is
+**3–4x denser** than a single `"mixed"` batch at the same budget (e.g.
+473 vs 128 non-dominated portfolios), and typically finds a better
+worst-case (`annualised_return_p1`) extreme too — spending part of the
+budget on refinement costs a small amount (~0.05–0.1pp, consistently
+across seeds) on the single best-median-return (`annualised_return_p50`)
+extreme specifically, since that tends to be a corner solution that raw
+vertex-heavy exploration with the FULL budget finds slightly more
+reliably than a budget split across generations. This is an inherent,
+expected trade-off of multi-objective refinement (a dense, wide frontier)
+versus single-objective extreme-seeking, not a bug — `exploration_frac`
+is the knob to trade one for the other.
 
 ---
 
@@ -300,13 +393,13 @@ PARETO_METRICS = [
 The `engine` package is designed for direct import:
 
 ```python
-from engine import run_bootstrap, load_portfolio_csv, shannon_entropy, compute_pareto
+from engine import run_bootstrap, load_portfolio_csv, effective_n_assets, compute_pareto
 from engine import config as cfg
 
 # single portfolio
 portfolio = load_portfolio_csv("sample_portfolio.csv")
 metrics = run_bootstrap(portfolio, n_sim=1000)
-print(metrics["annualised_return_p50"], metrics["shannon_entropy"])
+print(metrics["annualised_return_p50"], metrics["effective_n_assets"])
 
 # multi-bootstrap
 from engine import run_multi_bootstrap

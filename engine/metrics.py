@@ -8,64 +8,79 @@ Contains both:
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import numpy as np
 
 from engine import config as cfg
 
+log = logging.getLogger("bootstrap.metrics")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Weight-based metrics  (no simulation required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def type_entropy(weights: np.ndarray, tickers: list[str]) -> float:
-    """Normalised Shannon entropy across asset-class *types*.
+def _shannon_nats(w: np.ndarray) -> float:
+    """Raw Shannon entropy in nats: ``H = -Σ wᵢ·ln(wᵢ)`` over ``wᵢ > 0``.
 
-    Weights are aggregated by TYPE (from TER_table.csv), then the standard
-    normalised Shannon entropy is computed on the type-level weight vector:
+    Zero weights contribute nothing (``0·ln 0 → 0``), which is what makes
+    every metric built on this independent of how many zero-weight slots
+    the weight vector happens to carry.
+    """
+    w = np.asarray(w, dtype=np.float64)
+    nz = w[w > 0]
+    if len(nz) == 0:
+        return 0.0
+    return -float(np.sum(nz * np.log(nz)))
 
-        H = -Σ wₜ·ln(wₜ)  (for wₜ > 0)
-        H_norm = H / ln(N_types)  ∈ [0, 1]
 
-    Returns 0.0 when only one type is present, 1.0 for equal type weights.
-    Tickers missing from the type map are grouped under "UNKNOWN".
+def effective_n_assets(weights: np.ndarray) -> float:
+    """Effective number of assets held: ``exp(H)`` (the perplexity of the
+    weight vector).
+
+    1.0 for a single-asset portfolio, exactly *k* for *k* equally-weighted
+    assets, and between the two for anything concentrated — e.g.
+    ``[0.9, 0.05, 0.03, 0.02]`` is "effectively 1.4 assets".
+
+    This deliberately replaces the earlier ``shannon_entropy``, which
+    divided ``H`` by ``ln(len(weights))`` — the length of the CONTAINER,
+    not a property of the portfolio. That made the same holdings score
+    differently depending on which tool computed them: a 73/27 two-asset
+    portfolio scored 0.84 from the Single Bootstrap section (weight vector
+    of length 2) and 0.22 from a Space Explorer run (length 15,
+    zero-padded), and an equally-weighted 5-asset portfolio read as a
+    perfect 1.00 in one place and 0.59 in the other. ``exp(H)`` is a
+    monotone transform of ``H``, so rankings WITHIN any single run are
+    unchanged — only the cross-tool disagreement goes away.
+    """
+    return round(float(np.exp(_shannon_nats(weights))), 6)
+
+
+def effective_n_types(weights: np.ndarray, tickers: list[str]) -> float:
+    """Effective number of asset-class TYPES held: ``exp(H)`` over
+    type-aggregated weights (types from ``TER_table.csv``).
+
+    Weights are summed by type first, so two equally-weighted STOCK
+    tickers count as one type, not two. Tickers missing from the type map
+    are grouped under ``"UNKNOWN"``.
+
+    Same container-independence as :func:`effective_n_assets` — see its
+    docstring for what this replaced and why.
     """
     from engine.data import load_type_map
 
     type_map = load_type_map()
     w = np.asarray(weights, dtype=np.float64)
 
-    # aggregate weights by type
     type_weights: dict[str, float] = {}
     for i, ticker in enumerate(tickers):
         t = type_map.get(ticker.upper(), "UNKNOWN")
         type_weights[t] = type_weights.get(t, 0.0) + w[i]
 
     tw = np.array(list(type_weights.values()), dtype=np.float64)
-    n = len(tw)
-    if n <= 1:
-        return 0.0
-    tw_nz = tw[tw > 0]
-    h = -float(np.sum(tw_nz * np.log(tw_nz)))
-    return round(h / np.log(n), 6)
-
-
-def shannon_entropy(weights: np.ndarray) -> float:
-    """Normalised Shannon entropy of a weight vector.
-
-    H = -Σ wᵢ·ln(wᵢ)  (for wᵢ > 0)
-    H_norm = H / ln(N)  ∈ [0, 1]  where N = total number of assets (including zeros)
-
-    Returns 0.0 for a single-asset portfolio, 1.0 for equal weights.
-    """
-    w = np.asarray(weights, dtype=np.float64)
-    n = len(w)                    # total assets, including zeros
-    if n <= 1:
-        return 0.0
-    w_nonzero = w[w > 0]
-    h = -float(np.sum(w_nonzero * np.log(w_nonzero)))
-    return round(h / np.log(n), 6)
+    return round(float(np.exp(_shannon_nats(tw))), 6)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -232,20 +247,41 @@ def compute_metrics(
     month).  Volatility windows and drawdown durations are converted
     back to calendar-month units automatically.
 
-    If *weights* is provided, Shannon entropy is included (no bootstrap needed).
-    If *tickers* is also provided, type entropy (diversification across
-    asset-class types) is included as well.
+    A *block_size* that doesn't evenly divide *horizon_months* truncates
+    the final partial block (see :func:`engine.simulation.simulate`), so
+    ``paths`` may cover fewer months than the nominal *horizon_years* asks
+    for. Annualised-return percentiles are computed against the months
+    ACTUALLY simulated (``paths.shape[1] - 1`` steps, each *block_size*
+    months), not the nominal horizon — using the nominal horizon here would
+    silently understate/overstate the annualised return by conflating
+    "fewer months were simulated" with "the portfolio performed worse".
+
+    If *weights* is provided, ``effective_n_assets`` is included (no
+    bootstrap needed). If *tickers* is also provided, ``effective_n_types``
+    (diversification across asset-class types) is included as well.
     """
     metrics: dict = {}
 
     # ── weight-based metrics ──────────────────────────────────────────────
     if weights is not None:
-        metrics["shannon_entropy"] = shannon_entropy(weights)
+        metrics["effective_n_assets"] = effective_n_assets(weights)
         if tickers is not None:
-            metrics["type_entropy"] = type_entropy(weights, tickers)
+            metrics["effective_n_types"] = effective_n_types(weights, tickers)
 
     # ── simulation-based metrics ──────────────────────────────────────────
-    metrics.update(_annualised_return_percentiles(paths, horizon_years, percentiles))
+    n_steps = paths.shape[1] - 1
+    effective_months = n_steps * max(block_size, 1)
+    if effective_months <= 0:
+        raise ValueError(f"paths has {n_steps} simulated steps — nothing to compute metrics on.")
+    if effective_months != horizon_months:
+        log.warning(
+            "[METRICS] block_size=%d doesn't evenly divide horizon_months=%d — "
+            "only %d months were actually simulated; annualising against that "
+            "instead of the nominal horizon.", block_size, horizon_months, effective_months,
+        )
+    effective_years = effective_months / 12.0
+
+    metrics.update(_annualised_return_percentiles(paths, effective_years, percentiles))
     metrics.update(_volatility_at_windows(paths, vol_windows, horizon_months,
                                           block_size=block_size))
 

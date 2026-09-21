@@ -23,11 +23,18 @@ Design notes (also surfaced in the GUI):
   fraction. See :func:`apply_withdrawal`.
 - A WITHDRAW phase's NET monthly target can be computed three ways
   (:class:`WithdrawalStyle`): a FIXED today's-€ amount, an amount that is
-  CURTAILED to a lower floor whenever the path is in a deep-enough
-  drawdown from its own historical high, or a PERCENTAGE of the current
-  portfolio value. The first is deterministic (identical across every
-  simulation); the other two are *path-dependent* — the target itself
-  differs simulation to simulation. See :func:`_resolve_withdrawal_target`.
+  CURTAILED to a lower floor whenever the path's MARKET is in a
+  deep-enough drawdown from its own historical high, or a PERCENTAGE of
+  the current portfolio value. The first is deterministic (identical
+  across every simulation); the other two are *path-dependent* — the
+  target itself differs simulation to simulation. See
+  :func:`_resolve_withdrawal_target`. DRAWDOWN_CURTAILED's trigger is
+  computed off a cash-flow-neutral market index, not off the account
+  balance — the balance's own peak is inflated by past contributions and
+  eroded by past withdrawals, so a balance-based trigger would fire from
+  spending alone even with the market flat or rising (see the
+  ``market_unit`` / ``market_unit_max`` tracking in
+  :func:`_simulate_from_monthly_returns`).
 - Loss carry-forward against future gains is NOT modelled — a documented
   simplification (``LOSS_CARRYFORWARD_SUPPORTED = False``).
 - Within a simulated month: (1) the market moves, (2) one-off lump sums
@@ -68,8 +75,13 @@ class WithdrawalStyle(str, Enum):
     ACCUMULATE / HOLD phases."""
     FIXED = "fixed"
     # Withdraw `monthly_amount` normally; cut to `reduced_monthly_amount`
-    # in any month where the path's drawdown from its own historical peak
-    # is at or beyond `drawdown_threshold_pct`. Re-evaluated every month.
+    # in any month where the portfolio's MARKET (a cash-flow-neutral index
+    # of the sampled returns alone) is at or beyond `drawdown_threshold_pct`
+    # below its own historical peak. Re-evaluated every month. Deliberately
+    # NOT the drawdown of the account balance V — V's own peak is inflated
+    # by past contributions and eroded by past withdrawals, so a
+    # balance-based trigger would fire from spending alone even in a flat
+    # or rising market.
     DRAWDOWN_CURTAILED = "drawdown_curtailed"
     # Withdraw `withdrawal_pct_per_month` % of the CURRENT portfolio value,
     # net (post-tax) — the target itself scales with the portfolio.
@@ -111,9 +123,10 @@ class Phase:
     - FIXED (default): only ``monthly_amount`` / ``real_growth_pct`` matter,
       exactly as before this field existed.
     - DRAWDOWN_CURTAILED: ``monthly_amount`` is the FULL target, cut to
-      ``reduced_monthly_amount`` whenever the path's drawdown from its own
-      running peak is >= ``drawdown_threshold_pct``. Both amounts grow
-      together under ``real_growth_pct``.
+      ``reduced_monthly_amount`` whenever that simulation's MARKET (not the
+      account balance — see :class:`WithdrawalStyle`) is >=
+      ``drawdown_threshold_pct`` below its own running peak. Both amounts
+      grow together under ``real_growth_pct``.
     - PERCENTAGE_OF_PORTFOLIO: ``monthly_amount`` / ``reduced_monthly_amount``
       / ``drawdown_threshold_pct`` are ignored; the net target is
       ``withdrawal_pct_per_month`` % of that simulation's CURRENT portfolio
@@ -253,7 +266,9 @@ class LifePlan:
         if self.phases and self.horizon_months > 0 and self.horizon_months % self.block_months != 0:
             problems.append(
                 f"block_months={self.block_months} does not evenly divide the "
-                f"{self.horizon_months}-month horizon; the final block will be truncated."
+                f"{self.horizon_months}-month horizon; the full horizon is still simulated "
+                f"(sample_monthly_returns samples one extra block and trims the excess), but "
+                f"the final sampled historical block is used only in part."
             )
 
         if self.phases and self.phases[0].kind == PhaseKind.WITHDRAW and self.initial_capital <= 0:
@@ -336,8 +351,8 @@ def _apply_inflow_or_lump(V: np.ndarray, B: np.ndarray, amount: float,
 
 def _resolve_withdrawal_target(
     style_id: int,
-    V: np.ndarray,
-    running_max: np.ndarray,
+    value: np.ndarray,
+    peak: np.ndarray,
     full_nominal: float,
     reduced_nominal: float,
     threshold_frac: float,
@@ -352,26 +367,36 @@ def _resolve_withdrawal_target(
     month it is the same for every simulation — only the resulting target
     (for styles 2 and 3) varies simulation to simulation.
 
-    Drawdown convention: ``dd = (running_max - V) / running_max`` — the
-    same peak-to-trough definition used by
-    :func:`engine.metrics._drawdown_series`. ``running_max`` is 0 only if
-    the path has never had a positive value; that path is dead, dd is
-    reported as 0, and the target collapses to 0 anyway once it goes
-    through :func:`apply_withdrawal`. The cut is binary: the FULL amount
-    applies while ``dd < threshold_frac``, the REDUCED floor applies from
+    ``value``/``peak`` mean different things depending on ``style_id`` —
+    the CALLER (:func:`_simulate_from_monthly_returns`) picks which series
+    to pass:
+
+    - style 2 (drawdown-curtailed): a cash-flow-neutral MARKET index and
+      its running peak (contributions/withdrawals/lump sums must NOT move
+      these, or the "drawdown" mixes market losses with the investor's own
+      spending — see the module docstring's DRAWDOWN_CURTAILED note).
+    - style 3 (percentage-of-portfolio): the real portfolio value ``V``
+      (``peak`` is unused).
+
+    Drawdown convention: ``dd = (peak - value) / peak`` — the same
+    peak-to-trough definition used by :func:`engine.metrics._drawdown_series`,
+    applied to whichever series the caller passed. ``peak`` is 0 only if
+    that series has never had a positive value; that path's dd is reported
+    as 0. The cut is binary: the FULL amount applies while
+    ``dd < threshold_frac``, the REDUCED floor applies from
     ``dd >= threshold_frac`` (the threshold month itself gets the cut).
     """
-    n = V.shape[0]
+    n = value.shape[0]
     if style_id == 0:
         return np.zeros(n, dtype=np.float64)
     if style_id == 1:
         return np.full(n, float(full_nominal), dtype=np.float64)
     if style_id == 2:
-        safe_peak = np.where(running_max > 0, running_max, 1.0)
-        dd = np.where(running_max > 0, (running_max - V) / safe_peak, 0.0)
+        safe_peak = np.where(peak > 0, peak, 1.0)
+        dd = np.where(peak > 0, (peak - value) / safe_peak, 0.0)
         return np.where(dd >= threshold_frac, float(reduced_nominal), float(full_nominal))
     if style_id == 3:
-        return np.maximum(V, 0.0) * float(pct_frac)
+        return np.maximum(value, 0.0) * float(pct_frac)
     raise ValueError(f"Unknown withdrawal style id: {style_id}")
 
 
@@ -510,6 +535,14 @@ class LifeSimResult:
     ruin_month: np.ndarray                 # (n_sim,), first month index where V==0, else -1
     inflation_index: np.ndarray            # (horizon_months + 1,), infl_m**k
     phase_id: np.ndarray                   # (horizon_months,), index into plan.phases
+    lump_outflow_requested: np.ndarray     # (horizon_months,), nominal €, >= 0 — sum of |negative lump
+                                            #   sum amounts| scheduled that month (deterministic: a lump
+                                            #   sum's size doesn't depend on the simulated market, only
+                                            #   its timing does, and timing is already resolved here)
+    lump_outflow_received: np.ndarray      # (n_sim, horizon_months), nominal €, net actually paid out —
+                                            #   equals lump_outflow_requested unless the portfolio couldn't
+                                            #   cover it (exhaustion), same convention as
+                                            #   realised_withdrawals vs withdrawal_requested
 
     def percentiles(self, pcts=(1, 10, 50, 90, 99), *, real: bool = True) -> np.ndarray:
         """``(len(pcts), horizon_months + 1)`` percentile bands.
@@ -752,11 +785,28 @@ class LifeSimResult:
         flow = self.cash_flow_at(H)
         suffix = "real" if real else "nominal"
 
+        # Compare each simulation against its OWN requested target, not the
+        # cross-simulation median (self.planned_withdrawals). For a
+        # path-dependent style (percentage-of-portfolio, drawdown-curtailed,
+        # ramp) the target itself varies simulation to simulation, so
+        # comparing against the median flags every below-median path as a
+        # "shortfall" even when it received exactly what IT asked for.
         shortfall_months = np.sum(
-            (self.planned_withdrawals[None, :] > 0)
-            & (self.realised_withdrawals < self.planned_withdrawals[None, :] - 1e-9),
+            (self.withdrawal_requested > 0)
+            & (self.realised_withdrawals < self.withdrawal_requested - 1e-9),
             axis=1,
         )
+
+        # A negative lump sum (e.g. a house purchase) is grossed-up and
+        # capped at whatever's available, same as a withdrawal — if the
+        # portfolio can't cover it, the sale is silently smaller than
+        # requested (see _apply_inflow_or_lump). Surface how often that
+        # happens instead of letting the plan look like it "worked".
+        lump_shortfall_paths = (
+            (self.lump_outflow_requested[None, :] > 0)
+            & (self.lump_outflow_received < self.lump_outflow_requested[None, :] - 1e-9)
+        ).any(axis=1)
+        prob_lump_shortfall = float(np.mean(lump_shortfall_paths)) if H > 0 else 0.0
 
         return {
             "final_value_p10": p10,
@@ -768,6 +818,7 @@ class LifeSimResult:
             "total_withdrawn_median": flow[f"cumulative_withdrawn_{suffix}"],
             "total_tax_paid_median": flow[f"cumulative_tax_{suffix}"],
             "shortfall_months_median": float(np.median(shortfall_months)) if H > 0 else 0.0,
+            "probability_of_lump_sum_shortfall": prob_lump_shortfall,
         }
 
 
@@ -818,7 +869,20 @@ def _simulate_from_monthly_returns(
 
     V = np.full(n_sim, plan.initial_capital, dtype=np.float64)
     B = np.full(n_sim, plan.initial_capital, dtype=np.float64)
-    running_max = np.full(n_sim, max(plan.initial_capital, 0.0), dtype=np.float64)
+
+    # Cash-flow-neutral market index and its running peak — tracks ONLY
+    # the sequence of monthly returns, never touched by contributions,
+    # lump sums or withdrawals. DRAWDOWN_CURTAILED reads its trigger off
+    # this, not off V's own running peak: V's peak is inflated by past
+    # contributions and eroded by past withdrawals, so a balance-based
+    # "drawdown" mixes market losses with the investor's own spending —
+    # it can trip the trigger (or postpone it) with the market flat or
+    # even rising, and a preceding ACCUMULATE phase's peak leaks into a
+    # later WITHDRAW phase's baseline. This index isolates the market
+    # move alone, matching engine.metrics._drawdown_series' definition
+    # applied to a market-only series, as the docstring promises.
+    market_unit = np.ones(n_sim, dtype=np.float64)
+    market_unit_max = np.ones(n_sim, dtype=np.float64)
 
     values = np.empty((n_sim, horizon_months + 1), dtype=np.float64)
     values[:, 0] = V
@@ -826,6 +890,8 @@ def _simulate_from_monthly_returns(
     realised_withdrawals = np.zeros((n_sim, horizon_months), dtype=np.float64)
     withdrawal_tax = np.zeros((n_sim, horizon_months), dtype=np.float64)
     taxes_paid = np.zeros((n_sim, horizon_months), dtype=np.float64)
+    lump_outflow_requested = np.zeros(horizon_months, dtype=np.float64)
+    lump_outflow_received = np.zeros((n_sim, horizon_months), dtype=np.float64)
     ruin_month = np.full(n_sim, -1, dtype=np.int64)
 
     progress_every = max(1, horizon_months // 10)
@@ -833,23 +899,43 @@ def _simulate_from_monthly_returns(
 
     for i in range(horizon_months):
         V = np.maximum(V * (1.0 + monthly[:, i]), 0.0)
-        running_max = np.maximum(running_max, V)
+        market_unit = market_unit * (1.0 + monthly[:, i])
+        market_unit_max = np.maximum(market_unit_max, market_unit)
 
         for lump_amount in lump_by_month.get(i, ()):
-            V, B, tax, _net = _apply_inflow_or_lump(V, B, lump_amount, tax_rate)
+            V, B, tax, net = _apply_inflow_or_lump(V, B, lump_amount, tax_rate)
             taxes_paid[:, i] += tax
-            running_max = np.maximum(running_max, V)
+            if lump_amount < 0:
+                # An outflow lump sum (e.g. a house purchase) is taxed like
+                # a sale via apply_withdrawal, which caps the sale at
+                # whatever's available — if the portfolio can't cover it,
+                # `net` silently comes back short instead of raising. Track
+                # requested vs received so that shortfall is visible instead
+                # of the plan quietly looking like it "worked".
+                lump_outflow_requested[i] += -lump_amount
+                lump_outflow_received[:, i] += net
+            # market_unit / market_unit_max deliberately untouched — a lump
+            # sum is a cash flow, not a market move.
 
         c = float(contribution[i])
         if c > 0:
             V = V + c
             B = B + c
-            running_max = np.maximum(running_max, V)
+            # market_unit / market_unit_max deliberately untouched, same reason.
 
         style_i = int(withdrawal_style[i])
         if style_i != 0:
+            # Style 2 (DRAWDOWN_CURTAILED) reads the market-only index;
+            # style 3 (PERCENTAGE_OF_PORTFOLIO / RAMP) reads the real
+            # balance V, since its target is explicitly "% of the current
+            # portfolio" — that one is supposed to track cash flows. Styles
+            # 0/1 (none/fixed) don't use either argument.
+            if style_i == 2:
+                dd_value, dd_peak = market_unit, market_unit_max
+            else:
+                dd_value, dd_peak = V, V
             w = _resolve_withdrawal_target(
-                style_i, V, running_max,
+                style_i, dd_value, dd_peak,
                 float(withdrawal_full[i]), float(withdrawal_reduced[i]),
                 float(withdrawal_threshold[i]), float(withdrawal_pct[i]),
             )
@@ -879,6 +965,8 @@ def _simulate_from_monthly_returns(
         taxes_paid = taxes_paid[:, :months_done]
         contribution = contribution[:months_done]
         phase_id = phase_id[:months_done]
+        lump_outflow_requested = lump_outflow_requested[:months_done]
+        lump_outflow_received = lump_outflow_received[:, :months_done]
         horizon_months = months_done
 
     inflation_index = _inflation_index(horizon_months, inflation_pct)
@@ -902,6 +990,8 @@ def _simulate_from_monthly_returns(
         ruin_month=ruin_month,
         inflation_index=inflation_index,
         phase_id=phase_id,
+        lump_outflow_requested=lump_outflow_requested,
+        lump_outflow_received=lump_outflow_received,
     )
 
 

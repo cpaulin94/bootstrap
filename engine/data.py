@@ -154,6 +154,20 @@ def load_returns(
     return dates, ret_arr
 
 
+def _date_range_mask(
+    dates: list[tuple[int, int]],
+    date_start: Optional[str],
+    date_end: Optional[str],
+) -> Optional[np.ndarray]:
+    """Boolean mask of rows within [date_start, date_end], or ``None`` if
+    both bounds are unset (meaning: keep everything, no mask needed)."""
+    if date_start is None and date_end is None:
+        return None
+    lo = _ym_key(date_start) if date_start else (0, 0)
+    hi = _ym_key(date_end) if date_end else (9999, 12)
+    return np.array([lo <= d <= hi for d in dates], dtype=bool)
+
+
 def apply_date_filter(
     dates: list[tuple[int, int]],
     returns: np.ndarray,
@@ -169,16 +183,13 @@ def apply_date_filter(
     date_start : ``"YYYY-MM"`` inclusive lower bound, or ``None``
     date_end   : ``"YYYY-MM"`` inclusive upper bound, or ``None``
     """
-    if date_start is None and date_end is None:
+    mask = _date_range_mask(dates, date_start, date_end)
+    if mask is None:
         log.debug("[FILTER] No date filter applied, keeping all %d rows", len(returns))
         return returns
 
-    lo = _ym_key(date_start) if date_start else (0, 0)
-    hi = _ym_key(date_end) if date_end else (9999, 12)
     log.info("[FILTER] Applying date filter [%s, %s] on %d rows",
              date_start or "*", date_end or "*", len(returns))
-
-    mask = np.array([lo <= d <= hi for d in dates], dtype=bool)
     filtered = returns[mask]
     log.info("[FILTER] After filter: %d / %d rows kept", len(filtered), len(returns))
     if len(filtered) == 0:
@@ -191,6 +202,77 @@ def apply_date_filter(
     return filtered
 
 
+def _load_and_filter(
+    ticker: str,
+    use_after_ter: bool,
+    date_start: Optional[str],
+    date_end: Optional[str],
+) -> tuple[list[tuple[int, int]], np.ndarray]:
+    """Load one ticker and apply the date-range filter to BOTH the dates and
+    the returns (``apply_date_filter`` only returns the returns array, which
+    is enough for independent-resampling callers but not for
+    :func:`align_on_common_dates`, which needs to know which calendar month
+    each remaining row belongs to)."""
+    dates, ret_arr = load_returns(ticker, use_after_ter)
+    mask = _date_range_mask(dates, date_start, date_end)
+    if mask is None:
+        return dates, ret_arr
+    filtered_dates = [d for d, m in zip(dates, mask) if m]
+    filtered_ret = ret_arr[mask]
+    if len(filtered_ret) == 0:
+        log.error("[FILTER] DATE FILTER LEFT 0 ROWS for %s! Available range: %s … %s",
+                  ticker, dates[0], dates[-1])
+        raise ValueError(
+            f"Date filter [{date_start}, {date_end}] left 0 rows for {ticker} — "
+            f"available range is {dates[0]} … {dates[-1]}"
+        )
+    return filtered_dates, filtered_ret
+
+
+def align_on_common_dates(
+    per_ticker: dict[str, tuple[list[tuple[int, int]], np.ndarray]],
+    tickers: list[str],
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Column-stack returns on the INTERSECTION of the tickers' calendar months.
+
+    Aligning by row position (the old behaviour: keep each series' last
+    ``min_len`` rows) is only correct if every series ends on the same
+    month. They don't — one ticker's history can end 33 months before
+    another's — so a row-tail alignment silently pairs different calendar
+    months across assets, destroying the cross-asset correlation the whole
+    bootstrap depends on. Aligning on the literal intersection of
+    (year, month) keys is the fix.
+
+    Parameters
+    ----------
+    per_ticker : ticker -> (dates, returns), same length pairs, as returned
+        by :func:`_load_and_filter`.
+    tickers    : the (already sorted) column order to emit.
+
+    Returns
+    -------
+    ret_matrix : (n_common_months, n_assets) array, one column per ticker
+        in *tickers* order, rows in ascending calendar-month order.
+    months     : the sorted list of (year, month) keys used — the common
+        history window, for logging / display.
+    """
+    common = set(per_ticker[tickers[0]][0])
+    for t in tickers[1:]:
+        common &= set(per_ticker[t][0])
+    if not common:
+        raise ValueError(
+            "No overlapping months across " + ", ".join(tickers) +
+            " — these assets cannot be simulated together."
+        )
+    months = sorted(common)
+    cols = []
+    for t in tickers:
+        dates, arr = per_ticker[t]
+        lookup = dict(zip(dates, arr))
+        cols.append(np.array([lookup[m] for m in months], dtype=np.float64))
+    return np.column_stack(cols), months
+
+
 def load_all_returns(
     portfolio: dict[str, float],
     use_after_ter: bool = True,
@@ -198,7 +280,8 @@ def load_all_returns(
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Load return arrays for every ticker; align to shortest history.
+    """Load return arrays for every ticker; align on the intersection of
+    their calendar months (see :func:`align_on_common_dates`).
 
     Parameters
     ----------
@@ -211,7 +294,8 @@ def load_all_returns(
     Returns
     -------
     weights : (n_assets,) array — in alphabetical ticker order
-    returns : (n_months, n_assets) array — each column is one asset
+    returns : (n_months, n_assets) array — each column is one asset, rows
+        are the calendar months common to every ticker (ascending)
     """
     if date_start is None:
         date_start = cfg.DATE_START
@@ -222,19 +306,19 @@ def load_all_returns(
     log.info("[LOAD_ALL] use_after_ter=%s  date_start=%s  date_end=%s",
              use_after_ter, date_start, date_end)
     t0 = time.perf_counter()
-    raw: dict[str, np.ndarray] = {}
+    raw: dict[str, tuple[list[tuple[int, int]], np.ndarray]] = {}
     for t in tickers:
-        dates, ret_arr = load_returns(t, use_after_ter)
-        raw[t] = apply_date_filter(dates, ret_arr, date_start, date_end)
-        log.info("[LOAD_ALL] %s → %d months after filter", t, len(raw[t]))
+        dates, ret_arr = _load_and_filter(t, use_after_ter, date_start, date_end)
+        raw[t] = (dates, ret_arr)
+        log.info("[LOAD_ALL] %s → %d months after filter", t, len(ret_arr))
 
-    lengths = {t: len(v) for t, v in raw.items()}
-    min_len = min(lengths.values())
-    log.info("[LOAD_ALL] Per-asset lengths: %s", lengths)
-    log.info("[LOAD_ALL] Aligning to shortest history: %d months", min_len)
-    if min_len < 24:
-        log.warning("[LOAD_ALL] Very short history (%d months) — results may be unreliable", min_len)
-    ret_matrix = np.column_stack([raw[t][-min_len:] for t in tickers])
+    log.info("[LOAD_ALL] Per-asset lengths: %s", {t: len(v[1]) for t, v in raw.items()})
+    ret_matrix, months = align_on_common_dates(raw, tickers)
+    log.info("[LOAD_ALL] Aligned on common calendar months: %d months (%04d-%02d … %04d-%02d)",
+             len(months), months[0][0], months[0][1], months[-1][0], months[-1][1])
+    if len(months) < 24:
+        log.warning("[LOAD_ALL] Very short common history (%d months) — results may be unreliable",
+                    len(months))
     weights = np.array([portfolio[t] for t in tickers], dtype=np.float64)
     elapsed = time.perf_counter() - t0
     log.info("[LOAD_ALL] Return matrix shape: %s  weights: %s  elapsed: %.3fs",
@@ -249,7 +333,8 @@ def preload_returns(
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
 ) -> tuple[list[str], np.ndarray]:
-    """Pre-load return data for a set of tickers.
+    """Pre-load return data for a set of tickers, aligned on the
+    intersection of their calendar months (see :func:`align_on_common_dates`).
 
     Use once, then call ``run_bootstrap_preloaded`` many times with
     different weight vectors (avoids repeated CSV I/O).
@@ -262,7 +347,8 @@ def preload_returns(
     Returns
     -------
     sorted_tickers : list[str]   — alphabetically sorted
-    ret_matrix     : (n_months, n_assets) array
+    ret_matrix     : (n_months, n_assets) array, rows are the calendar
+        months common to every ticker (ascending)
     """
     if date_start is None:
         date_start = cfg.DATE_START
@@ -273,23 +359,89 @@ def preload_returns(
     log.info("[PRELOAD] use_after_ter=%s  date_start=%s  date_end=%s",
              use_after_ter, date_start, date_end)
     t0 = time.perf_counter()
-    raw: dict[str, np.ndarray] = {}
+    raw: dict[str, tuple[list[tuple[int, int]], np.ndarray]] = {}
     for t in tickers_sorted:
-        dates, ret_arr = load_returns(t, use_after_ter)
-        raw[t] = apply_date_filter(dates, ret_arr, date_start, date_end)
-        log.info("[PRELOAD] %s → %d months after filter", t, len(raw[t]))
+        dates, ret_arr = _load_and_filter(t, use_after_ter, date_start, date_end)
+        raw[t] = (dates, ret_arr)
+        log.info("[PRELOAD] %s → %d months after filter", t, len(ret_arr))
 
-    lengths = {t: len(v) for t, v in raw.items()}
-    min_len = min(lengths.values())
-    log.info("[PRELOAD] Per-asset lengths: %s", lengths)
-    log.info("[PRELOAD] Aligning to shortest history: %d months", min_len)
-    if min_len < 24:
-        log.warning("[PRELOAD] Very short history (%d months) — results may be unreliable", min_len)
-    ret_matrix = np.column_stack([raw[t][-min_len:] for t in tickers_sorted])
+    log.info("[PRELOAD] Per-asset lengths: %s", {t: len(v[1]) for t, v in raw.items()})
+    ret_matrix, months = align_on_common_dates(raw, tickers_sorted)
+    log.info("[PRELOAD] Aligned on common calendar months: %d months (%04d-%02d … %04d-%02d)",
+             len(months), months[0][0], months[0][1], months[-1][0], months[-1][1])
+    if len(months) < 24:
+        log.warning("[PRELOAD] Very short common history (%d months) — results may be unreliable",
+                    len(months))
     elapsed = time.perf_counter() - t0
     log.info("[PRELOAD] Return matrix shape: %s  elapsed: %.3fs",
              ret_matrix.shape, elapsed)
     return tickers_sorted, ret_matrix
+
+
+def load_portfolios_on_common_window(
+    portfolios: dict[str, dict[str, float]],
+    use_after_ter: bool = True,
+    *,
+    date_start: Optional[str] = None,
+    date_end: Optional[str] = None,
+) -> tuple[list[str], np.ndarray, dict[str, np.ndarray]]:
+    """Load several portfolios onto ONE shared historical window.
+
+    The window is the calendar-month intersection across the UNION of
+    every portfolio's tickers, so each portfolio is evaluated on exactly
+    the same months as the others.
+
+    This matters whenever portfolios are ranked against each other. Given
+    their own windows, a portfolio built from long-history assets is
+    measured over a different (usually longer, and differently-composed)
+    period than one holding a late-starting asset — so part of any
+    performance gap is the PERIOD, not the portfolio, and the tool
+    silently rewards holding assets with more history. Measured on this
+    repo's data, a 2-asset portfolio scored 7.90% vs a 12-asset one at
+    7.70% on their own windows (449 vs 305 months), but 6.09% vs 7.70% on
+    the shared 305-month window — the ranking REVERSES.
+
+    Contrast with :func:`load_all_returns`, which is still correct for
+    evaluating ONE portfolio on its own terms: there, nothing is being
+    ranked, so maximising that portfolio's usable history is the right
+    default. (Forcing every single-portfolio computation onto a fixed
+    universe-wide window was tried and reverted — see AUDIT.md M9 — since
+    it truncates history using assets the portfolio doesn't even hold.)
+
+    Returns
+    -------
+    tickers    : list[str] — the union, alphabetically sorted
+    ret_matrix : (n_months, n_tickers) array on the shared window
+    weights    : {portfolio_name: (n_tickers,) array}, zero-padded and
+        aligned to *tickers*
+    """
+    if date_start is None:
+        date_start = cfg.DATE_START
+    if date_end is None:
+        date_end = cfg.DATE_END
+
+    union = sorted({t for pf in portfolios.values() for t in pf})
+    if not union:
+        raise ValueError("No tickers across the given portfolios.")
+
+    log.info("[COMMON_WINDOW] %d portfolios, %d distinct tickers: %s",
+             len(portfolios), len(union), union)
+    raw: dict[str, tuple[list[tuple[int, int]], np.ndarray]] = {}
+    for t in union:
+        raw[t] = _load_and_filter(t, use_after_ter, date_start, date_end)
+
+    ret_matrix, months = align_on_common_dates(raw, union)
+    log.info("[COMMON_WINDOW] Shared window: %d months (%04d-%02d … %04d-%02d)",
+             len(months), months[0][0], months[0][1], months[-1][0], months[-1][1])
+    if len(months) < 24:
+        log.warning("[COMMON_WINDOW] Very short shared history (%d months) — "
+                    "results may be unreliable", len(months))
+
+    weights = {
+        name: np.array([pf.get(t, 0.0) for t in union], dtype=np.float64)
+        for name, pf in portfolios.items()
+    }
+    return union, ret_matrix, weights
 
 
 def load_independent_returns(

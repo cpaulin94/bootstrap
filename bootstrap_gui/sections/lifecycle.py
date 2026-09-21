@@ -92,6 +92,8 @@ def plan_to_dict(plan: LifePlan) -> dict:
         "n_sim": plan.n_sim,
         "block_months": plan.block_months,
         "seed": plan.seed,
+        "date_start": plan.date_start,
+        "date_end": plan.date_end,
     }
 
 
@@ -107,6 +109,8 @@ def plan_from_dict(d: dict) -> LifePlan:
         n_sim=int(d.get("n_sim", cfg.LIFE_N_SIM)),
         block_months=int(d.get("block_months", cfg.LIFE_BLOCK_MONTHS)),
         seed=d.get("seed", 42),
+        date_start=d.get("date_start") or None,
+        date_end=d.get("date_end") or None,
     )
 
 
@@ -652,6 +656,17 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
         )
         self.warnings_label.pack(anchor="w", fill="x", pady=(4, 0))
 
+        # ── Historical date window ───────────────────────────────────────────
+        date_frame = self._section(inner, "Historical Data Window")
+        self.date_start_var = tk.StringVar(value="")
+        self.date_end_var = tk.StringVar(value="")
+        FieldLabel(date_frame, text="Start (YYYY-MM)", bg=theme.BG).pack(anchor="w")
+        ttk.Entry(date_frame, textvariable=self.date_start_var,
+                  font=(theme.FONT_FAMILY[0], 10), width=12).pack(anchor="w", pady=(0, 4))
+        FieldLabel(date_frame, text="End (YYYY-MM)", bg=theme.BG).pack(anchor="w")
+        ttk.Entry(date_frame, textvariable=self.date_end_var,
+                  font=(theme.FONT_FAMILY[0], 10), width=12).pack(anchor="w")
+
         # ── Simulation params + Run ─────────────────────────────────────────
         sim = self._section(inner, "Simulation")
         self.n_sim_var = tk.StringVar(value=str(cfg.LIFE_N_SIM))
@@ -819,6 +834,10 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
         self.readout_ruin_label = ttk.Label(frame, text="Ruined paths: —", style="Secondary.TLabel",
                                              wraplength=200)
         self.readout_ruin_label.pack(anchor="w")
+        self.readout_lump_shortfall_label = ttk.Label(
+            frame, text="", style="Error.TLabel", wraplength=200,
+        )
+        self.readout_lump_shortfall_label.pack(anchor="w")
 
     # ── Portfolio / plan combobox refresh ────────────────────────────────
 
@@ -986,6 +1005,10 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
             block_months=self._safe_int(self.block_var, cfg.LIFE_BLOCK_MONTHS)
             if hasattr(self, "block_var") else cfg.LIFE_BLOCK_MONTHS,
             seed=seed,
+            date_start=self.date_start_var.get().strip() or None
+            if hasattr(self, "date_start_var") else None,
+            date_end=self.date_end_var.get().strip() or None
+            if hasattr(self, "date_end_var") else None,
         )
 
     # ── Save / load plans ─────────────────────────────────────────────────
@@ -1014,6 +1037,8 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
         self.n_sim_var.set(str(plan.n_sim))
         self.block_var.set(str(plan.block_months))
         self.seed_var.set(str(plan.seed))
+        self.date_start_var.set(plan.date_start or "")
+        self.date_end_var.set(plan.date_end or "")
         self._phases = list(plan.phases)
         self._lump_sums = list(plan.lump_sums)
         self._refresh_phase_tree()
@@ -1030,12 +1055,21 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
 
     # ── Run / Stop ─────────────────────────────────────────────────────────
 
-    def _get_returns_cached(self, portfolio_name: str, weights_dict: dict) -> tuple[np.ndarray, np.ndarray]:
-        key = (portfolio_name,)
+    def _get_returns_cached(
+        self, portfolio_name: str, weights_dict: dict,
+        date_start: Optional[str], date_end: Optional[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # date_start/date_end are part of the key (not just portfolio_name):
+        # a plan's Historical Data Window can change without the library
+        # itself changing, and that's a different data window entirely.
+        key = (portfolio_name, date_start, date_end)
         cached = self._returns_cache.get(key)
         if cached is not None:
             return cached
-        result = load_all_returns(weights_dict, cfg.USE_AFTER_TER_RETURNS)
+        result = load_all_returns(
+            weights_dict, cfg.USE_AFTER_TER_RETURNS,
+            date_start=date_start, date_end=date_end,
+        )
         self._returns_cache[key] = result
         return result
 
@@ -1046,10 +1080,24 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
 
         plan = self._build_plan_from_ui()
         problems = plan.validate()
-        hard_block = (not plan.phases) or plan.horizon_months <= 0
+        # tax_rate_pct >= 100 isn't just an unusual input: apply_withdrawal's
+        # gross-up denominator (1 - tax_rate * latent_gain_fraction) goes
+        # negative once the latent gain exceeds 1/tax_rate, and the
+        # withdrawal silently comes back as 0 — a "successful" run with
+        # every number quietly wrong, not an error. Every other soft
+        # problem below degrades visibly (an engine exception, an obviously
+        # off number) or is a plan the user might deliberately want to
+        # explore anyway; this one doesn't, so it's blocked outright rather
+        # than just listed as a warning.
+        bad_tax_rate = not (0.0 <= plan.tax_rate_pct < 100.0)
+        hard_block = (not plan.phases) or plan.horizon_months <= 0 or bad_tax_rate
         self.warnings_label.config(text="  •  ".join(problems) if problems else "")
         if hard_block:
-            self.error_label.show(problems[0] if problems else "Invalid plan — add at least one phase.")
+            if bad_tax_rate:
+                message = "Tax rate must be in [0, 100) — withdrawals go silently to zero above that."
+            else:
+                message = problems[0] if problems else "Invalid plan — add at least one phase."
+            self.error_label.show(message)
             return
 
         portfolio_name = plan.portfolio_name
@@ -1065,7 +1113,9 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
         self._last_result = None
 
         try:
-            weights, returns = self._get_returns_cached(portfolio_name, weights_dict)
+            weights, returns = self._get_returns_cached(
+                portfolio_name, weights_dict, plan.date_start, plan.date_end,
+            )
         except Exception as e:
             self.error_label.show(f"Could not load return data: {e}")
             self.run_btn.config(state="normal")
@@ -1094,6 +1144,14 @@ class LifeStrategySection(tk.Frame, BackgroundJobMixin):
             if self._last_result is not None:
                 self._render_charts(self._last_result)
                 self.status_label.config(text="Simulation complete.")
+                prob = self._last_result.summary().get("probability_of_lump_sum_shortfall", 0.0)
+                if prob > 0:
+                    self.readout_lump_shortfall_label.config(
+                        text=f"⚠ {fmt.pct(prob)} of paths couldn't fully fund a "
+                             f"negative lump sum (portfolio too small at the time)."
+                    )
+                else:
+                    self.readout_lump_shortfall_label.config(text="")
             else:
                 self.status_label.config(text="Simulation cancelled.")
 

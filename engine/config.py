@@ -28,12 +28,12 @@ RESULTS_FILE = os.path.join(RESULTS_DIR, "multi_bootstrap_results.csv")
 # Simulation parameters
 # ═══════════════════════════════════════════════════════════════════════════════
 
-N_SIMULATIONS: int      = 1_000     # Monte-Carlo paths per portfolio
+N_SIMULATIONS: int      = 50_000    # Monte-Carlo paths per portfolio
 HORIZON_YEARS: int      = 10        # investment horizon in years
 MONTHS_PER_YEAR: int    = 12
 HORIZON_MONTHS: int     = HORIZON_YEARS * MONTHS_PER_YEAR
 
-BLOCK_SIZE: int         = 6        # block-bootstrap block length in months
+BLOCK_SIZE: int         = 12       # block-bootstrap block length in months
                                     # 1 = classic iid bootstrap (no autocorrelation)
                                     # 12 = sample year-long consecutive blocks
 
@@ -59,7 +59,8 @@ BAD_PERCENTILE: float         = 2   # worst-case fraction for drawdown metrics
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SEARCH_CSV: str    = os.path.join(BASE_DIR, "search.csv")
-SEARCH_METHOD: str = "random"       # "random" or "grid"
+SEARCH_METHOD: str = "random"       # "random" | "mixed" (recommended, see
+                                     # engine.search.sample_mixed_portfolios) | "grid"
 N_PORTFOLIOS: int  = 10_000         # random-search count (ignored for grid)
 GRID_STEP: float   = 0.05           # grid-search increment (ignored for random)
 
@@ -75,7 +76,7 @@ PARETO_METRICS: list[dict] = [
     {"name": "annualised_return_p1",               "direction": "maximize"},
     {"name": f"volatility_{VOLATILITY_WINDOWS[-1]}y", "direction": "minimize"},
     {"name": f"max_dd_depth_p{_bp}",               "direction": "minimize"},
-    {"name": "type_entropy",                "direction": "maximize"},
+    {"name": "effective_n_types",           "direction": "maximize"},
     
 ]
 
